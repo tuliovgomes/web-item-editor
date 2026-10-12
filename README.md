@@ -1,41 +1,112 @@
-# OTEditor TypeScript
+# OTEditor TS — editor web de assets do Open Tibia
 
-An independent Node.js + TypeScript implementation for Open Tibia assets, with a local browser editor for the DAT+SPR+OTFI workflow. The editor opens or creates projects, edits the supported DAT properties and sprite references, previews/replaces/adds sprites, and validates/compiles output files for download.
+Projeto **open source** (licença [MIT](./LICENSE)) que reimplementa, em **Node.js + TypeScript**, um editor de assets para o ecossistema Open Tibia. Ele roda localmente no navegador e trabalha com o conjunto **DAT + SPR + OTFI** do cliente.
 
-## Status
+É uma implementação independente: nenhum código ou recurso do OTEditor original foi copiado. Nenhum arquivo proprietário de cliente é distribuído com o projeto.
 
-- Implemented: strict TypeScript setup; OTFI parsing and creation; initial version-aware DAT parsing for all four categories and supported property edits; SPR read/edit/write; coordinated project open/create/compile; local HTTP API and browser UI; OTB reader/writer and CLI.
-- Supported editor operations: browse/create/remove DAT records, edit recognized properties and flags, edit sprite references, preview/replace/add sprites, and compile/download the DAT+SPR+OTFI triplet.
-- Not implemented: complete client-version and DAT flag coverage, preservation/editing of unknown DAT flags, image import beyond exact-size raster files, undo/history, OBD, `items.xml`, OTBM, updater and AI service.
-- No real proprietary client files are included. See [the original audit](./docs/original-audit.md), [Assets-Editor review](./docs/assets-editor-review.md), [format notes](./docs/formats.md), [compatibility evidence](./docs/compatibility.md), [architecture](./docs/architecture.md), [performance notes](./docs/performance.md), and [implementation plan](./IMPLEMENTATION_PLAN.md).
+## O que ele faz
 
-## Run with Docker
+- Abre uma **pasta de projeto** (um único seletor) e lê `.dat`, `.spr` e `.otfi` automaticamente. O OTFI é opcional.
+- Detecta o layout do SPR e a versão do cliente quando não há OTFI, ou quando o OTFI não corresponde ao DAT (com aviso).
+- Navega por itens, outfits, efeitos e projéteis em uma grade de miniaturas, com animações, paginação e ir direto para uma página digitando o número.
+- Edita propriedades e flags do DAT em um modal, criando e removendo registros.
+- Navega, substitui, adiciona, importa e exporta sprites (PNG, ZIP, spritesheets; botão direito ou arrastar e soltar).
+- **Seleção múltipla** de registros e **exportação `.obd`** (Object Builder Data v2), em arquivo único ou ZIP.
+- **Importação `.obd`** arrastando e soltando os arquivos na janela (sempre cria um novo registro).
+- Valida e compila o trio DAT + SPR + OTFI para download. Os arquivos originais nunca são sobrescritos.
+- Inclui também um leitor/escritor de OTB e uma CLI.
 
-Docker Engine and Compose plugin are required. The commands below run Node inside Docker; Node/npm do not need to be installed on the host. Build from the project root:
+Os detalhes dos formatos, limites e a compatibilidade estão em [`docs/`](./docs): [formatos](./docs/formats.md), [compatibilidade](./docs/compatibility.md), [arquitetura](./docs/architecture.md) e [desempenho](./docs/performance.md).
+
+## Como executar (passo a passo)
+
+Você só precisa de **Docker**. Node.js e npm não precisam estar instalados no computador.
+
+1. **Instale o Docker** (Docker Engine ou Docker Desktop) e confirme que funciona:
+
+   ```bash
+   docker --version
+   ```
+
+2. **Clone o repositório** e entre na pasta:
+
+   ```bash
+   git clone https://github.com/tuliovgomes/web-item-editor.git
+   cd web-item-editor
+   ```
+
+3. **Inicie o editor:**
+
+   ```bash
+   npm run dev
+   ```
+
+   O comando monta a imagem Docker e sobe o servidor. Ele usa `http://127.0.0.1:4173`; se a porta estiver ocupada, escolhe outra e a imprime. Para encerrar, pressione `Ctrl+C`.
+
+   > Sem npm no host, use o equivalente direto em Docker:
+   >
+   > ```bash
+   > docker build -t oteditor-ts .
+   > docker run --rm -p 127.0.0.1:4173:4173 -e HOST=0.0.0.0 -e PORT=4173 oteditor-ts npm run start
+   > ```
+
+4. **Abra no navegador** o endereço exato impresso no terminal.
+
+5. **Selecione a pasta do projeto**, a que contém o `.dat`, o `.spr` e, se houver, o `.otfi`, e clique em **Abrir pasta selecionada**. Deixe a versão do cliente em `0` para detecção automática, ou informe a versão exata se souber.
+
+6. **Edite** e clique em **Validar e compilar** para baixar os arquivos gerados.
+
+### Dicas
+
+- O servidor guarda o projeto aberto **na memória**. Se ele reiniciar, recarregue a página e abra a pasta de novo.
+- SPRs grandes ficam inteiros na memória. Um SPR de ~3 GB precisa de pelo menos 8 GB de memória para o Docker. O limite é de 4 GiB por arquivo.
+- Cada reinício do `npm run dev` deixa um container novo. Se uma instância antiga estiver ocupando a porta, pare-a com `docker ps` e `docker stop <id>`.
+
+## Uso
+
+| Ação | Como |
+| --- | --- |
+| Abrir registro | Clique na miniatura |
+| Selecionar vários registros | `Ctrl`/`⌘`+clique, `Shift`+clique (intervalo), `Ctrl+A`; `Esc` limpa |
+| Exportar `.obd` | Botão direito no registro (1 arquivo, ou ZIP com vários) |
+| Importar `.obd` | Arrastar e soltar os arquivos na janela |
+| Exportar/importar sprites | Botão direito na grade de sprites; arrastar imagens/spritesheets |
+| Ir para uma página | Digitar o número no campo do rodapé da lista |
+
+### Limites do OBD
+
+Só o OBD v2 (LZMA, pixels ARGB 32×32). O OBD v1 não é suportado. Há apenas um grupo de frames (outfits com vários grupos exportam o grupo 0, com aviso). Bones, `npcSaleData`, `changer` e `podium` não existem no formato e são descartados com aviso. A versão do cliente gravada é a inferida do projeto. Flags não suportadas pela versão do projeto são ignoradas com aviso na importação.
+
+### Conjuntos problemáticos
+
+- **Sem OTFI:** o layout do SPR (16/32 bits, RGB/RGBA) é detectado e as versões de DAT 1100, 1057, 1050, 1010, 960, 860, 780 e 772 são testadas até uma abrir por completo.
+- **OTFI inconsistente com o SPR** (por exemplo `transparency: false` com pixels RGBA): o editor usa o formato real, mostra um aviso e corrige o OTFI na compilação.
+- **OTFI inconsistente com o DAT** (por exemplo, OTFI de 10.57 com um DAT de 8.54): o editor tenta outras versões e informa qual usou.
+
+## Desenvolvimento
+
+Com Docker (não precisa de Node no host):
 
 ```bash
 docker build -t oteditor-ts .
 docker run --rm oteditor-ts npm run typecheck
-docker run --rm oteditor-ts npm test
 docker run --rm oteditor-ts npm run lint
+docker run --rm oteditor-ts npm test
 docker run --rm oteditor-ts npm run build
 ```
 
-Run the browser editor from the project root with:
+Com Node.js 24 instalado:
 
 ```bash
-npm run dev
+npm ci
+npm run dev:web     # servidor em desenvolvimento (tsx)
+npm test
+npm run typecheck
+npm run lint
+npm run build
 ```
 
-The project npm proxy sends this command to Docker, so host Node.js is not needed. It builds the image, uses `http://127.0.0.1:4173` when available, or chooses and prints another localhost port if 4173 is occupied, and stops the container when you press Ctrl+C. Open the exact URL printed by the command. Select a folder containing one DAT/SPR/OTFI set, then click **Abrir pasta selecionada**. Leave client version at `0` to infer a minimum version from OTFI (`frame-groups` => 10.57, `frame-durations` => 10.50, `extended` => 9.60); without OTFI the fallback is 7.72. Enter the exact version manually if known. OTFI is optional. Uploads are sent one at a time and held in memory, with a 4 GiB per-file limit (a ~3 GB SPR needs ≥ 8 GB of Docker memory). Increase Docker memory appropriately for large SPR files. Source files are never overwritten. Supported format operations and explicit limits are documented in [format notes](./docs/formats.md).
-
-To launch the same editor without the npm wrapper, use:
-
-```bash
-docker run --rm -p 127.0.0.1:4173:4173 -e HOST=0.0.0.0 -e PORT=4173 oteditor-ts npm run start
-```
-
-To run the CLI's development command in Docker, mount the project directory and data directory:
+### CLI (OTB)
 
 ```bash
 docker run --rm -v "$PWD/data:/data" oteditor-ts npm run dev:cli -- inspect /data/items.otb
@@ -43,39 +114,18 @@ docker run --rm -v "$PWD/data:/data" oteditor-ts npm run dev:cli -- roundtrip /d
 docker run --rm -v "$PWD/data:/data" oteditor-ts npm run dev:cli -- set /data/items.otb /data/items-edited.otb 100 name "Example item"
 ```
 
-The CLI refuses an existing output and refuses to overwrite its input. `set` addresses an item by its server ID and accepts the writable fields shown by `npm run dev:cli -- help`. The data directory must exist on the host, and be writable if the command creates output files.
+A CLI recusa sobrescrever a entrada ou uma saída existente.
 
-## Local development (with Node.js installed)
+## Status e limitações
 
-```bash
-npm ci
-npm run dev -- help
-npm test
-npm run typecheck
-npm run lint
-npm run build
-npm run dev:web
-```
+- Cobertura de versões de cliente e de flags do DAT ainda incompleta; flags desconhecidas não são preservadas nem editáveis.
+- Sem histórico/desfazer, `items.xml`, OTBM, atualizador ou serviço de IA.
+- O suporte a OTB não é anunciado como completo, pois não foi validado com corpora externos.
 
-## Compatibility and licensing
+## Contribuindo
 
-OTB support is intentionally not advertised as complete: real external corpora and application-consumer tests have not been run here. The original OTEditor clone has no root-level license file. This implementation does not copy original code or assets; confirm licensing before distributing a derivative project.
+Contribuições são bem-vindas: abra uma issue ou um pull request. Antes de enviar, rode `typecheck`, `lint` e `test`. Não envie arquivos proprietários de clientes (`.dat`, `.spr`) como fixtures.
 
-### Conjuntos sem OTFI
+## Licença
 
-Com a versão em automático e sem OTFI, o editor detecta o layout do SPR (contagem de 16/32 bits, pixels RGB/RGBA) e testa as versões de DAT 1100, 1057, 1050, 1010, 960, 860, 780 e 772 até uma abrir por completo. Validado com `Archlight_2026`: versão 1100, SPR estendido com alpha. O OTFI gerado é incluído na compilação.
-
-## OTFI inconsistente com o SPR
-
-Se o OTFI declara `transparency` de forma contrária aos pixels reais do SPR (ex.: `transparency: false` com sprites RGBA, como em alguns conjuntos Object Builder), o editor tenta o formato oposto, usa o que parseia, exibe um aviso e corrige o OTFI na compilação.
-
-## Sprites: importação e exportação
-
-Botão direito em sprites: exportar PNG/ZIP, importar imagens ou spritesheets (sempre anexa novas sprites; limites de 50 arquivos, 32 MiB e 8192×8192 px por arquivo). Spritesheets também podem ser importadas por arrastar e soltar.
-
-### OBD (Object Builder Data)
-
-- **Seleção múltipla de registros:** Ctrl/⌘+clique, Shift+clique (intervalo), Ctrl+A sobre a grade; Esc limpa. Com seleção ativa, o clique simples apenas alterna a seleção.
-- **Exportar:** botão direito nos registros → "Exportar .obd" (1 arquivo) ou ZIP com um `.obd` por objeto.
-- **Importar:** somente arrastando e soltando arquivos `.obd` na janela. Cada arquivo cria um **novo** registro (nunca sobrescreve) e anexa as sprites ao SPR.
-- Formato: OBD v2 (LZMA, pixels ARGB 32×32). Limitações: OBD v1 não é suportado; só um grupo de frames (outfits com vários grupos exportam o grupo 0, com aviso); sem bones/npcSaleData/changer/podium; a versão do cliente gravada é a inferida do projeto; flags não suportadas pela versão do projeto são ignoradas com aviso.
+[MIT](./LICENSE). O repositório original do OTEditor não possui arquivo de licença na raiz; este projeto não copia seu código nem seus recursos.
