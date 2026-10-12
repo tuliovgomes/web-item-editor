@@ -75,3 +75,14 @@ test("adopts the real SPR pixel format when the OTFI transparency flag is wrong"
   assert.equal(reopened.summary.warnings.length, 1);
   assert.match(reopened.compile()[2]!.data.toString("utf8"), /transparency: false/);
 });
+
+test("falls back to another flag table when the OTFI-inferred version cannot parse the DAT", () => {
+  const source = AssetProject.create(0x1234, { clientVersion: 854 });
+  const id = source.createRecord("items");
+  source.setProperty("items", id, "chargeable", true);
+  const files = source.compile();
+  const byName = (ext: string) => files.find((file) => file.name.endsWith(ext))!.data;
+  const otfi = Buffer.from(byName(".otfi").toString("utf8").replace(/frame-groups: false/, "frame-groups: true"));
+  const reopened = AssetProject.open({ dat: byName(".dat"), spr: byName(".spr"), otfi }, { clientVersion: 0 });
+  assert.ok(reopened.summary.clientVersion >= 700);
+});

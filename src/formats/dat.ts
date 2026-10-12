@@ -763,7 +763,8 @@ function readRecord(
     const patternY = cursor.readU8("DAT sprite pattern Y");
     const patternZ = cursor.readU8("DAT sprite pattern Z");
     const frames = cursor.readU8("DAT animation frame count");
-    if (layers === 0 || patternX === 0 || patternY === 0 || patternZ === 0 || frames === 0) {
+    // Some exports (e.g. decrypted Object Builder sets) keep empty outfit groups with zero frames and no sprite IDs.
+    if (layers === 0 || patternX === 0 || patternY === 0 || patternZ === 0) {
       fail("DAT sprite layout dimensions must be non-zero", cursor.offset - 5);
     }
 

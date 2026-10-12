@@ -248,13 +248,13 @@ let spriteFetchLastNotice = 0;
 
 function markSpriteFetchUnavailable(error) {
   const message = String(error?.message ?? error);
-  const transient = error instanceof TypeError || /Failed to fetch|ERR_CONNECTION_REFUSED|NetworkError/i.test(message);
+  const transient = error instanceof TypeError || /Failed to fetch|ERR_CONNECTION_REFUSED|ERR_NETWORK_CHANGED|NetworkError|No asset project is open/i.test(message);
   if (!transient) return error;
   const now = Date.now();
   spriteFetchBackoffUntil = Math.max(spriteFetchBackoffUntil, now + SPRITE_FETCH_BACKOFF_MS);
   if (now - spriteFetchLastNotice > SPRITE_FETCH_BACKOFF_MS) {
     spriteFetchLastNotice = now;
-    setMessage("Servidor indisponível no momento. Tentando reconectar…", "error");
+    setMessage(/No asset project is open/i.test(message) ? "O servidor foi reiniciado e perdeu o projeto. Recarregue a página e abra a pasta novamente." : "Servidor indisponível no momento. Tentando reconectar…", "error");
   }
   const unavailable = new Error("Servidor indisponível no momento. Tentando reconectar…");
   unavailable.name = "ServerUnavailableError";

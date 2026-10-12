@@ -177,3 +177,14 @@ test("validates OTFI boolean values rather than coercing invalid text to false",
   const document = OtfiDocument.parse("DatSpr\n  extended: maybe\n");
   assert.throws(() => document.settings, /Invalid boolean value/);
 });
+
+test("accepts records whose animation has zero frames and no sprite IDs", () => {
+  const header = Buffer.alloc(12);
+  header.writeUInt32LE(0x1234_5678);
+  header.writeUInt16LE(100, 4);
+  const source = Buffer.concat([header, Buffer.from([0xff, 1, 1, 1, 1, 1, 1, 0])]);
+  const record = DatDocument.parse(source, classic).getRecord("items", 100);
+  assert.equal(record?.groups[0]?.frames, 0);
+  assert.deepEqual(record?.groups[0]?.spriteIds, []);
+  assert.deepEqual(DatDocument.parse(source, classic).serialize(), source);
+});

@@ -117,10 +117,31 @@ export class AssetProject {
       ? OtfiDocument.create(defaultsForVersion(requestedVersion || 772))
       : OtfiDocument.parse(files.otfi);
     const settings = otfi.settings;
-    const clientVersion = requestedVersion || inferClientVersion(settings);
-    const datOptions = parseOptions(clientVersion, settings);
-    const dat = DatDocument.parse(files.dat, datOptions);
+    let clientVersion = requestedVersion || inferClientVersion(settings);
     const warnings: string[] = [];
+    let dat: DatDocument;
+    try {
+      dat = DatDocument.parse(files.dat, parseOptions(clientVersion, settings));
+    } catch (error) {
+      if (requestedVersion !== 0) throw error;
+      // The OTFI only describes the layout; flag numbering depends on the real client version.
+      const fallback = [854, 1100, 1057, 1010, 960, 860, 780, 772]
+        .filter((version) => version !== clientVersion)
+        .map((version) => {
+          try {
+            return { version, dat: DatDocument.parse(files.dat, parseOptions(version, settings)) };
+          } catch {
+            return undefined;
+          }
+        })
+        .find((entry) => entry !== undefined);
+      if (fallback === undefined) throw error;
+      warnings.push(
+        `O DAT não é compatível com a versão ${clientVersion} inferida do OTFI; o editor usou a tabela de flags da versão ${fallback.version}.`,
+      );
+      clientVersion = fallback.version;
+      dat = fallback.dat;
+    }
     let spr: SprDocument;
     try {
       spr = SprDocument.parse(files.spr, sprOptions(settings));
