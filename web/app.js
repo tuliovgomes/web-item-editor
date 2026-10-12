@@ -414,7 +414,12 @@ function renderRecordList(result) {
     thumbObserver.observe(button);
   }
   const totalPages = Math.max(1, Math.ceil(result.total / state.pageSize));
-  $("#pageLabel").textContent = result.total ? `${state.page + 1} / ${totalPages}` : "vazio";
+  $("#pageLabel").textContent = result.total ? `/ ${totalPages}` : "vazio";
+  const pageInput = $("#pageInput");
+  pageInput.disabled = !result.total;
+  pageInput.max = String(totalPages);
+  pageInput.value = result.total ? String(state.page + 1) : "";
+  state.totalPages = totalPages;
   $("#previousPage").disabled = state.page === 0;
   $("#nextPage").disabled = (state.page + 1) * state.pageSize >= result.total;
 }
@@ -782,6 +787,22 @@ $("#nextPage").addEventListener("click", () => {
   state.page += 1;
   refreshRecords();
 });
+function parsePageNumber(input, totalPages) {
+  const value = Number(input.value);
+  if (!Number.isInteger(value) || value < 1) return null;
+  return Math.min(value, totalPages) - 1;
+}
+
+$("#pageInput").addEventListener("change", (event) => {
+  const page = parsePageNumber(event.target, state.totalPages ?? 1);
+  if (page === null) {
+    event.target.value = String(state.page + 1);
+    return;
+  }
+  state.page = page;
+  refreshRecords();
+});
+
 $("#closeModal").addEventListener("click", () => $("#recordModal").close());
 $("#recordModal").addEventListener("close", () => stopAnimation($("#modalThumb")));
 $("#addRecord").addEventListener("click", addRecord);
@@ -867,7 +888,11 @@ function renderSpriteGrid() {
   const grid = $("#spriteGrid");
   grid.replaceChildren();
   state.sprites.rendered = true;
-  $("#spritePageLabel").textContent = total ? `${first}–${last} de ${total}` : "sem sprites";
+  $("#spritePageLabel").textContent = total ? `/ ${pages} · ${first}–${last} de ${total}` : "sem sprites";
+  const spriteInput = $("#spritePageInput");
+  spriteInput.disabled = !total;
+  spriteInput.max = String(pages);
+  spriteInput.value = total ? String(state.sprites.page + 1) : "";
   $("#spritePrev").disabled = state.sprites.page === 0;
   $("#spriteNext").disabled = last >= total;
   updateSelectionCount();
@@ -933,6 +958,17 @@ $("#spriteGrid").addEventListener("keydown", (event) => {
     document.querySelectorAll(".sprite-tile").forEach((tile) => tile.classList.add("selected"));
     updateSelectionCount();
   }
+});
+$("#spritePageInput").addEventListener("change", (event) => {
+  const total = state.summary?.sprites.spriteCount ?? 0;
+  const pages = Math.max(1, Math.ceil(total / state.sprites.pageSize));
+  const page = parsePageNumber(event.target, pages);
+  if (page === null) {
+    event.target.value = String(state.sprites.page + 1);
+    return;
+  }
+  state.sprites.page = page;
+  renderSpriteGrid();
 });
 $("#spritePrev").addEventListener("click", () => { state.sprites.page = Math.max(0, state.sprites.page - 1); renderSpriteGrid(); });
 $("#spriteNext").addEventListener("click", () => { state.sprites.page += 1; renderSpriteGrid(); });

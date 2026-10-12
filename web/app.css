@@ -136,3 +136,6 @@ footer { padding: 0 20px 24px; color: #6f7e99; text-align: center; font-size: .7
 .props-list dd { margin: 0; }
 dialog.props-dialog { width: min(520px, 94vw); }
 @media (max-width: 700px) { .import-panel { grid-template-columns: 1fr; } }
+
+.page-jump { display: inline-flex; align-items: center; gap: 6px; }
+.page-jump input { width: 5.5em; padding: 4px 6px; text-align: center; }

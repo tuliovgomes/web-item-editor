@@ -73,7 +73,7 @@
           <div id="recordList" class="record-grid"></div>
           <div class="list-pagination">
             <button id="previousPage" aria-label="Página anterior">←</button>
-            <span id="pageLabel">—</span>
+            <span class="page-jump"><input id="pageInput" type="number" min="1" step="1" inputmode="numeric" aria-label="Ir para a página" disabled> <span id="pageLabel">—</span></span>
             <button id="nextPage" aria-label="Próxima página">→</button>
           </div>
         </section>
@@ -107,7 +107,7 @@
             </div>
             <div class="inline-control">
               <button id="spritePrev" aria-label="Sprites anteriores">←</button>
-              <span id="spritePageLabel" class="hint">—</span>
+              <span class="page-jump"><input id="spritePageInput" type="number" min="1" step="1" inputmode="numeric" aria-label="Ir para a página de sprites" disabled> <span id="spritePageLabel" class="hint">—</span></span>
               <button id="spriteNext" aria-label="Próximos sprites">→</button>
               <button id="importSheetsButton">Importar imagens…</button>
             </div>
