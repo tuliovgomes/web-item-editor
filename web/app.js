@@ -1134,26 +1134,75 @@ async function exportSprites(ids) {
   setMessage(`${ids.length} sprites exportadas em ZIP.`, "success");
 }
 
-async function fetchObd(category, id) {
+async function fetchObd(category, id, signal) {
   const query = new URLSearchParams({ category, id: String(id) });
-  const response = await api(`/api/project/obd?${query}`);
+  const response = await api(`/api/project/obd?${query}`, { signal });
   const warnings = JSON.parse(decodeURIComponent(response.headers.get("x-obd-warnings") || "%5B%5D"));
   return { data: new Uint8Array(await response.arrayBuffer()), warnings };
 }
 
+const OBD_EXPORT_CONCURRENCY = 4;
+
 async function exportObd(category, ids) {
-  const warnings = [];
-  const entries = [];
-  for (let index = 0; index < ids.length; index += 1) {
-    setMessage(`Exportando OBD ${index + 1}/${ids.length} (objetos grandes podem levar alguns segundos cada)…`);
-    const result = await fetchObd(category, ids[index]);
-    entries.push({ name: `${category}_${ids[index]}.obd`, data: result.data });
-    result.warnings.forEach((warning) => warnings.push(`${category} ${ids[index]}: ${warning}`));
+  if (importState.running) {
+    setMessage("Já existe uma importação ou exportação em andamento.", "error");
+    return;
   }
-  if (entries.length === 1) downloadBytes(entries[0].data, entries[0].name, "application/octet-stream");
-  else downloadBytes(IO.buildZip(entries), `${category}_${ids[0]}-${ids.at(-1)}_obd.zip`, "application/zip");
-  const suffix = warnings.length ? ` Avisos: ${warnings.slice(0, 3).join(" | ")}${warnings.length > 3 ? " …" : ""}` : "";
-  setMessage(`${entries.length} objeto(s) exportado(s) em .obd.${suffix}`, warnings.length ? "" : "success");
+  importState.running = true;
+  importState.abort = new AbortController();
+  const { signal } = importState.abort;
+  const started = performance.now();
+  const results = new Array(ids.length);
+  const failures = [];
+  const warnings = [];
+  let finished = 0;
+  let bytes = 0;
+  let next = 0;
+  const report = () =>
+    setImportPanel(
+      `Exportando OBD ${finished}/${ids.length} · ${(bytes / 1024).toFixed(0)} KiB · ${((performance.now() - started) / 1000).toFixed(1)} s`,
+      (finished / ids.length) * 100,
+    );
+  const worker = async () => {
+    while (!signal.aborted && next < ids.length) {
+      const index = next++;
+      try {
+        const result = await fetchObd(category, ids[index], signal);
+        results[index] = { name: `${category}_${ids[index]}.obd`, data: result.data };
+        bytes += result.data.length;
+        result.warnings.forEach((warning) => warnings.push(`${category} ${ids[index]}: ${warning}`));
+      } catch (error) {
+        if (signal.aborted) return;
+        failures.push(`${category} ${ids[index]}: ${error.message}`);
+      }
+      finished += 1;
+      report();
+    }
+  };
+  try {
+    report();
+    await Promise.all(Array.from({ length: Math.min(OBD_EXPORT_CONCURRENCY, ids.length) }, worker));
+    const seconds = ((performance.now() - started) / 1000).toFixed(1);
+    if (signal.aborted) {
+      setImportPanel(`Exportação cancelada (${finished}/${ids.length} processado(s)).`, 100, false);
+      setMessage("Exportação cancelada; nenhum arquivo foi baixado.", "error");
+      return;
+    }
+    const entries = results.filter(Boolean);
+    if (entries.length === 0) throw new Error(failures[0] ?? "nenhum objeto exportado");
+    if (entries.length === 1) downloadBytes(entries[0].data, entries[0].name, "application/octet-stream");
+    else downloadBytes(IO.buildZip(entries), `${category}_${ids[0]}-${ids.at(-1)}_obd.zip`, "application/zip");
+    const notes = [...failures.map((failure) => `falha ${failure}`), ...warnings];
+    const suffix = notes.length ? ` Avisos: ${notes.slice(0, 3).join(" | ")}${notes.length > 3 ? " …" : ""}` : "";
+    setImportPanel(`Concluído: ${entries.length}/${ids.length} OBD em ${seconds} s.`, 100, false);
+    setMessage(`${entries.length} objeto(s) exportado(s) em .obd (${seconds} s).${suffix}`, notes.length ? "" : "success");
+  } catch (error) {
+    setImportPanel(`Falha na exportação: ${error.message}`, 100, false);
+    setMessage(`Falha ao exportar OBD: ${error.message}`, "error");
+  } finally {
+    importState.running = false;
+    importState.abort = null;
+  }
 }
 
 async function importObdFiles(files) {

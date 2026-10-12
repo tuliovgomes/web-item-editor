@@ -161,12 +161,27 @@ function writeProperties(output: Writer, properties: Readonly<Record<string, Pro
   output.u8(LAST_FLAG);
 }
 
-function toLzma(raw: Buffer): Buffer {
-  const packed = compress(raw, 1);
+/** LZMA mode 1 is the fastest preset of the pure-JS encoder; mode 5 was ~2.7x slower on sprite data. */
+export const OBD_COMPRESSION_LEVEL = 1;
+
+export function compressObd(raw: Buffer, level: number = OBD_COMPRESSION_LEVEL): Buffer {
+  const packed = compress(raw, level);
   return Buffer.from(Int8Array.from(packed).buffer);
 }
 
-export function encodeObd(input: ObdEncodeInput): ObdEncodeResult {
+export interface ObdPayload {
+  /** Uncompressed OBD payload; `compressObd` turns it into the final file. */
+  readonly raw: Buffer;
+  readonly warnings: string[];
+  readonly spriteCount: number;
+}
+
+export function encodeObd(input: ObdEncodeInput, level: number = OBD_COMPRESSION_LEVEL): ObdEncodeResult {
+  const payload = buildObdPayload(input);
+  return { data: compressObd(payload.raw, level), warnings: payload.warnings };
+}
+
+export function buildObdPayload(input: ObdEncodeInput): ObdPayload {
   const { record, clientVersion } = input;
   if (input.spriteSize !== OBD_SPRITE_SIZE) {
     throw new ObdFormatError(`OBD only stores ${OBD_SPRITE_SIZE}×${OBD_SPRITE_SIZE} sprites; this project uses ${input.spriteSize}`);
@@ -234,7 +249,7 @@ export function encodeObd(input: ObdEncodeInput): ObdEncodeResult {
     output.u32(spriteId);
     output.raw(argb);
   }
-  return { data: toLzma(output.toBuffer()), warnings };
+  return { raw: output.toBuffer(), warnings, spriteCount: group.spriteIds.length };
 }
 
 export interface ObdThing {

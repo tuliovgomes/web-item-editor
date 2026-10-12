@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { DatDocument, type DatCategory, type DatParseOptions, type DatRecordView } from "../formats/dat.js";
-import { decodeObd, encodeObd, type ObdEncodeResult } from "../formats/obd.js";
+import { buildObdPayload, compressObd, decodeObd, type ObdEncodeResult, type ObdPayload } from "../formats/obd.js";
 import { OtfiDocument, type OtfiSettings } from "../formats/otfi.js";
 import { SprDocument, type SprInfo, type SprOptions } from "../formats/spr.js";
 
@@ -250,15 +250,21 @@ export class AssetProject {
     return this.#spr.addSprite(rgba);
   }
 
-  exportObd(category: DatCategory, id: number): ObdEncodeResult {
+  /** Builds the uncompressed OBD payload; compression is the expensive step and is done by the caller. */
+  prepareObd(category: DatCategory, id: number): ObdPayload {
     const record = this.#dat.getRecord(category, id);
     if (record === undefined) throw new Error(`No ${category} record with ID ${id}`);
-    return encodeObd({
+    return buildObdPayload({
       record,
       clientVersion: this.#clientVersion,
       spriteSize: this.#spr.info.spriteSize,
       getSprite: (spriteId) => this.#spr.getSprite(spriteId),
     });
+  }
+
+  exportObd(category: DatCategory, id: number): ObdEncodeResult {
+    const payload = this.prepareObd(category, id);
+    return { data: compressObd(payload.raw), warnings: payload.warnings };
   }
 
   /** Appends the OBD object as a new record; existing records and sprites are never overwritten. */

@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { AssetProject } from "./project/project.js";
+import { AbortedError, ObdWorkerPool } from "./project/obd-pool.js";
 import type { DatCategory } from "./formats/dat.js";
 import type { CompiledProjectFile } from "./project/project.js";
 
@@ -176,6 +177,7 @@ export function createEditorServer(): EditorServer {
   let uploads: StagedUploads = {};
   let compiled: CompiledFiles | undefined;
 
+  const obdPool = new ObdWorkerPool();
   const server = createServer((request, response) => {
     void (async () => {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
@@ -405,8 +407,24 @@ export function createEditorServer(): EditorServer {
         if (project === undefined) throw new Error("No asset project is open");
         const category = categoryFrom(url.searchParams.get("category"));
         const id = numberParam(url, "id");
-        const { data, warnings } = project.exportObd(category, id);
+        const started = process.hrtime.bigint();
+        const payload = project.prepareObd(category, id);
+        const built = process.hrtime.bigint();
+        const aborter = new AbortController();
+        response.on("close", () => {
+          if (!response.writableEnded) aborter.abort();
+        });
+        let data: Buffer;
+        try {
+          data = await obdPool.compress(payload.raw, aborter.signal);
+        } catch (error) {
+          if (error instanceof AbortedError) return;
+          throw error;
+        }
+        const warnings = payload.warnings;
+        const done = process.hrtime.bigint();
         response.writeHead(200, {
+          "server-timing": `build;dur=${Number(built - started) / 1e6}, compress;dur=${Number(done - built) / 1e6}`,
           "content-type": "application/octet-stream",
           "content-length": data.length,
           "cache-control": "no-store",
@@ -495,6 +513,7 @@ export function createEditorServer(): EditorServer {
     },
     close() {
       return new Promise((resolveClose, reject) => {
+        void obdPool.close();
         server.close((error) => error ? reject(error) : resolveClose());
       });
     },
