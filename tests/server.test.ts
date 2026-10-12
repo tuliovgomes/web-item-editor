@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { AssetProject } from "../src/project/project.js";
 import { createEditorServer } from "../src/server.js";
 
-test("rejects oversized uploads immediately with the active 2 GiB limit", async () => {
+test("rejects oversized uploads immediately with the active 4 GiB limit", async () => {
   const editor = createEditorServer();
   const port = await editor.start(0);
 
@@ -17,7 +17,7 @@ test("rejects oversized uploads immediately with the active 2 GiB limit", async 
         method: "POST",
         headers: {
           "content-type": "application/octet-stream",
-          "content-length": String(2 * 1024 * 1024 * 1024 + 1),
+          "content-length": String(4 * 1024 * 1024 * 1024 + 1),
         },
       }, (result) => {
         let body = "";
@@ -30,7 +30,7 @@ test("rejects oversized uploads immediately with the active 2 GiB limit", async 
     });
 
     assert.equal(response.status, 413);
-    assert.match(response.body, /limite de 2 GiB por arquivo/);
+    assert.match(response.body, /limite de 4 GiB por arquivo/);
   } finally {
     await editor.close();
   }

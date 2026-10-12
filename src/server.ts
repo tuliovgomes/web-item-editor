@@ -5,7 +5,7 @@ import { AssetProject } from "./project/project.js";
 import type { DatCategory } from "./formats/dat.js";
 import type { CompiledProjectFile } from "./project/project.js";
 
-const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024 - 1;
 const CATEGORIES = new Set<DatCategory>(["items", "outfits", "effects", "missiles"]);
 type UploadKind = "dat" | "spr" | "otfi";
 type DownloadFormat = "dat" | "spr" | "otfi";

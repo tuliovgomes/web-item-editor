@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 
-const DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024;
-const MAX_SPRITE_COUNT = 2_000_000;
+const DEFAULT_MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024 - 1;
+const MAX_SPRITE_COUNT = 5_000_000;
 
 export interface SprOptions {
   readonly extended: boolean;

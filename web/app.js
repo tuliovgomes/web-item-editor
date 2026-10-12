@@ -242,10 +242,38 @@ async function refreshRecords() {
 
 const thumbCache = new Map();
 const THUMB_CACHE_LIMIT = 4000;
+const SPRITE_FETCH_BACKOFF_MS = 5000;
+let spriteFetchBackoffUntil = 0;
+let spriteFetchLastNotice = 0;
+
+function markSpriteFetchUnavailable(error) {
+  const message = String(error?.message ?? error);
+  const transient = error instanceof TypeError || /Failed to fetch|ERR_CONNECTION_REFUSED|NetworkError/i.test(message);
+  if (!transient) return error;
+  const now = Date.now();
+  spriteFetchBackoffUntil = Math.max(spriteFetchBackoffUntil, now + SPRITE_FETCH_BACKOFF_MS);
+  if (now - spriteFetchLastNotice > SPRITE_FETCH_BACKOFF_MS) {
+    spriteFetchLastNotice = now;
+    setMessage("Servidor indisponível no momento. Tentando reconectar…", "error");
+  }
+  const unavailable = new Error("Servidor indisponível no momento. Tentando reconectar…");
+  unavailable.name = "ServerUnavailableError";
+  return unavailable;
+}
 
 async function fetchSpriteRgba(id) {
   if (thumbCache.has(id)) return thumbCache.get(id);
-  const response = await api(`/api/project/sprite?id=${id}`);
+  if (Date.now() < spriteFetchBackoffUntil) {
+    const unavailable = new Error("Servidor indisponível no momento. Tentando reconectar…");
+    unavailable.name = "ServerUnavailableError";
+    throw unavailable;
+  }
+  let response;
+  try {
+    response = await api(`/api/project/sprite?id=${id}`);
+  } catch (error) {
+    throw markSpriteFetchUnavailable(error);
+  }
   const data = new Uint8ClampedArray(await response.arrayBuffer());
   if (thumbCache.size >= THUMB_CACHE_LIMIT) thumbCache.delete(thumbCache.keys().next().value);
   thumbCache.set(id, data);
@@ -282,7 +310,8 @@ async function drawThumbnail(canvas, record, frame = 0) {
     try {
       const rgba = await fetchSpriteRgba(cell.id);
       bufferContext.putImageData(new ImageData(new Uint8ClampedArray(rgba), size, size), (width - 1 - cell.w) * size, (height - 1 - cell.h) * size);
-    } catch {
+    } catch (error) {
+      if (error?.name === "ServerUnavailableError") return;
       // Missing sprites stay transparent in the thumbnail.
     }
   }
@@ -774,12 +803,22 @@ function spriteSize() {
 }
 
 async function fetchSprites(ids, signal) {
+  if (Date.now() < spriteFetchBackoffUntil) {
+    const unavailable = new Error("Servidor indisponível no momento. Tentando reconectar…");
+    unavailable.name = "ServerUnavailableError";
+    throw unavailable;
+  }
   const bytes = spriteSize() * spriteSize() * 4;
   const frames = [];
   for (let start = 0; start < ids.length; start += 512) {
     signal?.throwIfAborted();
     const chunk = ids.slice(start, start + 512);
-    const response = await api(`/api/project/sprites?ids=${chunk.join(",")}`, { signal });
+    let response;
+    try {
+      response = await api(`/api/project/sprites?ids=${chunk.join(",")}`, { signal });
+    } catch (error) {
+      throw markSpriteFetchUnavailable(error);
+    }
     const data = new Uint8ClampedArray(await response.arrayBuffer());
     if (data.length !== chunk.length * bytes) throw new Error("O servidor devolveu sprites incompletos.");
     chunk.forEach((_, index) => frames.push(data.subarray(index * bytes, (index + 1) * bytes)));

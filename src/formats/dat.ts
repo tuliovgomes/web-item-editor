@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import type { OtfiSettings } from "./otfi.js";
 
-const DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024 - 1;
 const MAX_TOTAL_RECORDS = 262_144;
 const MAX_SPRITES_PER_RECORD = 1_048_576;
 
