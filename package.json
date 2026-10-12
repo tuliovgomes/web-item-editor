@@ -1,0 +1,29 @@
+{
+  "name": "oteditor-ts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Open Tibia asset editing core and command-line tools",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "dev": "sh ./scripts/dev.sh",
+    "dev:cli": "tsx src/cli.ts",
+    "dev:web": "tsx src/server.ts",
+    "start": "node dist/src/server.js",
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "test": "tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "eslint": "^10.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.0.0"
+  },
+  "dependencies": {
+    "lzma": "2.3.2"
+  }
+}

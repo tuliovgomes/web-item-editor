@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -e
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE_NAME=oteditor-ts:dev
+cd "$PROJECT_DIR"
+
+if [ "$#" -ge 2 ] && [ "$1" = "run" ] && [ "$2" = "dev" ]; then
+    exec sh ./scripts/dev.sh "${@:3}"
+fi
+
+docker build -t "$IMAGE_NAME" .
+exec docker run --rm "$IMAGE_NAME" npm "$@"

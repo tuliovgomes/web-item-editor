@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>OTEditor — Editor local</title>
+    <link rel="stylesheet" href="/app.css">
+    <script src="/sprite-io.js" defer></script>
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">OPEN TIBIA ASSET TOOLING</p>
+        <h1>OTEditor <span>local</span></h1>
+      </div>
+      <div id="projectStatus" class="status-pill">Nenhum projeto aberto</div>
+    </header>
+
+    <main>
+      <section class="card project-card">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">PROJETO</p>
+            <h2>Abrir ou criar assets</h2>
+          </div>
+        </div>
+        <div class="project-grid">
+          <div class="form-stack">
+            <label>Versão do cliente
+              <input id="clientVersion" type="number" min="0" value="0">
+            </label>
+            <p class="hint">Deixe em 0 para inferir o layout a partir do OTFI. Informe a versão manualmente se não houver OTFI ou se ela for conhecida.</p>
+            <label>Pasta do projeto (DAT, SPR e OTFI)
+              <input id="projectFolder" type="file" webkitdirectory directory multiple>
+            </label>
+            <p id="folderContents" class="hint">Selecione uma pasta que contenha os arquivos do cliente.</p>
+            <button id="openProject" class="primary">Abrir pasta selecionada</button>
+          </div>
+          <div class="form-stack create-box">
+            <p>Ou comece um conjunto vazio. Os arquivos-fonte nunca são sobrescritos; a compilação é baixada como novos arquivos.</p>
+            <label>Assinatura DAT/SPR (inteiro sem sinal)
+              <input id="signature" type="number" min="0" max="4294967295" value="1">
+            </label>
+            <button id="createProject">Criar projeto vazio</button>
+          </div>
+        </div>
+        <div id="message" role="status" class="message" aria-live="polite"></div>
+      </section>
+
+      <section id="workspace" class="workspace hidden">
+        <section class="card browser-card">
+          <div class="section-heading compact">
+            <div>
+              <p class="eyebrow">DAT</p>
+              <h2>Objetos</h2>
+            </div>
+            <button id="addRecord" title="Criar registro" aria-label="Criar registro">＋</button>
+          </div>
+          <label>Categoria
+            <select id="category">
+              <option value="items">Itens</option>
+              <option value="outfits">Outfits</option>
+              <option value="effects">Efeitos</option>
+              <option value="missiles">Projéteis</option>
+            </select>
+          </label>
+          <label>Buscar por ID
+            <input id="searchId" type="search" inputmode="numeric" placeholder="ex.: 100">
+          </label>
+          <span id="recordSelectionCount" class="chip hidden"></span>
+          <div id="recordList" class="record-grid"></div>
+          <div class="list-pagination">
+            <button id="previousPage" aria-label="Página anterior">←</button>
+            <span id="pageLabel">—</span>
+            <button id="nextPage" aria-label="Próxima página">→</button>
+          </div>
+        </section>
+
+        <section class="card sprite-card">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">SPR</p>
+              <h2>Sprite</h2>
+            </div>
+          </div>
+          <label>ID do sprite
+            <div class="inline-control">
+              <input id="spriteId" type="number" min="1" value="1">
+              <button id="loadSprite">Carregar</button>
+            </div>
+          </label>
+          <div class="canvas-frame"><canvas id="spriteCanvas" width="32" height="32"></canvas></div>
+          <label>Substituir por PNG
+            <input id="spriteImage" type="file" accept="image/png,image/webp,image/bmp">
+          </label>
+          <button id="replaceSprite">Substituir sprite selecionado</button>
+          <button id="addSprite">Adicionar sprite da imagem</button>
+          <p class="hint">A imagem deve ter exatamente as dimensões do projeto. Transparência e cores são codificadas pelo modo OTFI.</p>
+        </section>
+        <section class="card sprite-browser-card" id="spriteBrowserCard">
+          <div class="section-heading compact">
+            <div>
+              <p class="eyebrow">SPR · BOTÃO DIREITO PARA IMPORTAR/EXPORTAR</p>
+              <h2>Sprites <span id="selectionCount" class="chip hidden"></span></h2>
+            </div>
+            <div class="inline-control">
+              <button id="spritePrev" aria-label="Sprites anteriores">←</button>
+              <span id="spritePageLabel" class="hint">—</span>
+              <button id="spriteNext" aria-label="Próximos sprites">→</button>
+              <button id="importSheetsButton">Importar imagens…</button>
+            </div>
+          </div>
+          <div id="spriteGrid" class="sprite-grid" tabindex="0" aria-label="Sprites do SPR"></div>
+          <div id="importPanel" class="import-panel hidden">
+            <div id="importText"></div>
+            <progress id="importProgress" max="100" value="0"></progress>
+            <button id="importCancel">Cancelar</button>
+          </div>
+          <input id="importSingleInput" type="file" accept="image/png,image/bmp,image/gif,image/jpeg,image/webp" class="hidden">
+          <input id="importSheetsInput" type="file" accept="image/png,image/bmp,image/gif,image/jpeg,image/webp,application/json,.json" multiple class="hidden">
+        </section>
+
+      </section>
+
+      <section id="compilePanel" class="card compile-card hidden">
+        <div>
+          <p class="eyebrow">SAÍDA</p>
+          <h2>Compilar conjunto DAT + SPR + OTFI</h2>
+          <p>O projeto é serializado, reaberto e validado antes de disponibilizar os arquivos para download.</p>
+        </div>
+        <button id="compileProject" class="primary">Validar e compilar</button>
+        <div id="downloads" class="downloads"></div>
+      </section>
+    </main>
+    <dialog id="recordModal" class="record-modal">
+      <div class="modal-head">
+        <canvas id="modalThumb" class="modal-thumb" width="32" height="32"></canvas>
+        <div>
+          <p class="eyebrow">PROPRIEDADES E FLAGS DAT</p>
+          <h2 id="recordTitle">Selecione um registro</h2>
+        </div>
+        <button id="removeRecord" class="danger">Excluir</button>
+        <button id="closeModal" aria-label="Fechar">✕</button>
+      </div>
+      <div id="modalMessage" class="message" role="status"></div>
+      <div id="recordMeta" class="record-meta"></div>
+      <div id="properties" class="properties"></div>
+      <div id="spriteReferences" class="sprite-references"></div>
+    </dialog>
+    <div id="spriteMenu" class="context-menu hidden" role="menu"></div>
+    <div id="dropOverlay" class="drop-overlay hidden" aria-hidden="true"><p>Solte sprites (PNG/spritesheet) ou arquivos .obd para importar</p></div>
+    <dialog id="spritePropsDialog" class="record-modal props-dialog">
+      <div class="modal-head">
+        <div><p class="eyebrow">SPR</p><h2>Propriedades da sprite</h2></div>
+        <button id="closeSpriteProps" aria-label="Fechar">✕</button>
+      </div>
+      <dl id="spritePropsList" class="props-list"></dl>
+    </dialog>
+    <footer>Processamento local em 127.0.0.1 · Arquivos não são enviados a serviços externos.</footer>
+  </body>
+</html>
