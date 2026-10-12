@@ -162,7 +162,7 @@ function writeProperties(output: Writer, properties: Readonly<Record<string, Pro
 }
 
 function toLzma(raw: Buffer): Buffer {
-  const packed = compress(raw, 5);
+  const packed = compress(raw, 1);
   return Buffer.from(Int8Array.from(packed).buffer);
 }
 

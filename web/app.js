@@ -1145,7 +1145,7 @@ async function exportObd(category, ids) {
   const warnings = [];
   const entries = [];
   for (let index = 0; index < ids.length; index += 1) {
-    setMessage(`Exportando OBD ${index + 1}/${ids.length}…`);
+    setMessage(`Exportando OBD ${index + 1}/${ids.length} (objetos grandes podem levar alguns segundos cada)…`);
     const result = await fetchObd(category, ids[index]);
     entries.push({ name: `${category}_${ids[index]}.obd`, data: result.data });
     result.warnings.forEach((warning) => warnings.push(`${category} ${ids[index]}: ${warning}`));
