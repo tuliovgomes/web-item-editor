@@ -66,3 +66,7 @@ interface OtbItem {
 ```
 
 The concrete implementation also retains raw binary node data and duplicate/unknown attributes; the sketch omits those preservation details for readability.
+
+## Modern client sprite catalog (read-only)
+
+Selecting a folder that contains `catalog-content.json` (Tibia 12+ `data/things/<version>`) opens the sprite library instead of a DAT/SPR project. Each `sprites-<hash>.bmp.lzma` sheet is a 384×384 32-bit BMP; `spritetype` 0/1/2/3 means 32×32, 32×64, 64×32 and 64×64 sprites laid out row-major from `firstspriteid`. The LZMA stream is wrapped in a CipSoft header (zero padding, five constant bytes, a 7-bit varint with the compressed size, LZMA properties, then an 8-byte field that is skipped), so the decoder rebuilds a standard LZMA-alone header with the BMP's fixed size. Some official sheets declare one ID more than they hold; that ID has no pixels and is reported as missing. Implemented in `src/formats/catalog.ts`; `appearances-*.dat` is an uncompressed protobuf (`Appearances` with `object`, `outfit`, `effect`, `missile` lists; schema taken from the OTClient binary) parsed by `src/formats/appearances.ts`: each appearance has frame groups (pattern X/Y/Z, layers, animation phases, `sprite_id` list) and a flags message. Sprite index inside a group is `((((frame*patternZ + z)*patternY + y)*patternX + x)*layers + layer)`; unlike the legacy DAT, each ID is one whole 32/64-pixel image, so there are no width×height cells. The catalog view is browse-only; editing and writing `appearances.dat` back is not implemented.

@@ -122,6 +122,10 @@ async function openProject() {
     setBusy(button, true, "Lendo arquivos…");
     const selectedFiles = $("#projectFolder").files;
     if (!selectedFiles.length) throw new Error("Selecione a pasta do projeto.");
+    if (findCatalogFile(selectedFiles)) {
+      await openCatalog(selectedFiles);
+      return;
+    }
     const { dat, spr, otfi } = findProjectFiles(selectedFiles);
     setMessage(`Enviando ${dat.name}…`);
     await uploadFile("dat", dat);
@@ -158,6 +162,12 @@ $("#projectFolder").addEventListener("change", () => {
     $("#folderContents").textContent = "Selecione uma pasta que contenha os arquivos do cliente.";
     return;
   }
+  const catalogFile = findCatalogFile(files);
+  if (catalogFile) {
+    const sheets = [...files].filter((file) => /^sprites-.+\.bmp\.lzma$/i.test(file.name)).length;
+    $("#folderContents").textContent = `${catalogFile.name} · ${sheets} folhas de sprites (cliente moderno)`;
+    return;
+  }
   try {
     const selected = findProjectFiles(files);
     $("#folderContents").textContent = [
@@ -168,6 +178,445 @@ $("#projectFolder").addEventListener("change", () => {
   } catch (error) {
     $("#folderContents").textContent = error.message;
   }
+});
+
+function findCatalogFile(files) {
+  return [...files].find((file) => file.name === "catalog-content.json");
+}
+
+const catalogState = { ids: new Int32Array(0), page: 0, pageSize: 120, cache: new Map(), token: 0 };
+const CATALOG_UPLOAD_CONCURRENCY = 6;
+const CATALOG_CACHE_LIMIT = 2000;
+
+async function openCatalog(selectedFiles) {
+  setMessage("Lendo catalog-content.json…");
+  const opened = await api("/api/catalog/open", {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream" },
+    body: findCatalogFile(selectedFiles),
+  });
+  const byName = new Map([...selectedFiles].map((file) => [file.name, file]));
+  const folderVersion = (findCatalogFile(selectedFiles).webkitRelativePath || "").split("/").at(-2) ?? "";
+  objectsState.clientVersion = /^\d{3,5}$/.test(folderVersion) ? Number(folderVersion) : 0;
+  const missing = opened.files.filter((name) => !byName.has(name));
+  if (missing.length === opened.files.length) {
+    throw new Error("A pasta tem o catalog-content.json, mas nenhuma folha sprites-*.bmp.lzma.");
+  }
+  const queue = opened.files.filter((name) => byName.has(name));
+  let done = 0;
+  const workers = Array.from({ length: CATALOG_UPLOAD_CONCURRENCY }, async () => {
+    while (queue.length) {
+      const name = queue.shift();
+      await api(`/api/catalog/sheet?name=${encodeURIComponent(name)}`, {
+        method: "POST",
+        headers: { "content-type": "application/octet-stream" },
+        body: byName.get(name),
+      });
+      done += 1;
+      if (done % 50 === 0 || !queue.length) setMessage(`Enviando folhas de sprites… ${done}/${opened.files.length - missing.length}`);
+    }
+  });
+  await Promise.all(workers);
+  let summary = opened.summary;
+  const appearances = summary.appearancesFile ? byName.get(summary.appearancesFile) : undefined;
+  if (appearances) {
+    setMessage(`Lendo ${appearances.name} (${formatBytes(appearances.size)})…`);
+    summary = (await api("/api/catalog/appearances", {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: appearances,
+    })).summary;
+  }
+  catalogState.cache.clear();
+  catalogState.page = 0;
+  catalogState.token += 1;
+  applyCatalogSummary(summary, missing.length);
+}
+
+function applyCatalogSummary(summary, missingSheets) {
+  const total = summary.ranges.reduce((sum, [first, last]) => sum + last - first + 1, 0);
+  const ids = new Int32Array(total);
+  let index = 0;
+  for (const [first, last] of summary.ranges) for (let id = first; id <= last; id += 1) ids[index++] = id;
+  catalogState.ids = ids;
+  $("#catalogCard").classList.remove("hidden");
+  $("#catalogCount").textContent = `${summary.spriteCount} sprites`;
+  $("#projectStatus").textContent = `catálogo · ${summary.spriteCount} sprites`;
+  renderCatalogGrid();
+  loadCatalogSprite(ids[0] ?? 0).catch(() => {});
+  applyObjectsSummary(summary);
+  setMessage(
+    missingSheets ? `Catálogo aberto, mas faltam ${missingSheets} folhas na pasta; esses sprites ficam vazios.` : "Catálogo de sprites carregado. Os arquivos ficam somente na memória do editor local.",
+    missingSheets ? "" : "success",
+  );
+}
+
+async function fetchCatalogSprite(id) {
+  const cached = catalogState.cache.get(id);
+  if (cached) return cached;
+  const response = await api(`/api/catalog/sprite?id=${id}`);
+  const sprite = {
+    width: Number(response.headers.get("x-sprite-width")),
+    height: Number(response.headers.get("x-sprite-height")),
+    rgba: new Uint8ClampedArray(await response.arrayBuffer()),
+  };
+  if (catalogState.cache.size >= CATALOG_CACHE_LIMIT) catalogState.cache.delete(catalogState.cache.keys().next().value);
+  catalogState.cache.set(id, sprite);
+  return sprite;
+}
+
+function drawCatalogSprite(canvas, sprite, box) {
+  canvas.width = sprite.width;
+  canvas.height = sprite.height;
+  canvas.getContext("2d").putImageData(new ImageData(sprite.rgba, sprite.width, sprite.height), 0, 0);
+  if (box) {
+    const scale = box / Math.max(sprite.width, sprite.height);
+    canvas.style.width = `${sprite.width * scale}px`;
+    canvas.style.height = `${sprite.height * scale}px`;
+  }
+}
+
+function renderCatalogGrid() {
+  const { ids, pageSize } = catalogState;
+  const pages = Math.max(1, Math.ceil(ids.length / pageSize));
+  catalogState.page = Math.min(catalogState.page, pages - 1);
+  const start = catalogState.page * pageSize;
+  const end = Math.min(ids.length, start + pageSize);
+  $("#catalogPageLabel").textContent = ids.length ? `/ ${pages} · IDs ${ids[start]}–${ids[end - 1]}` : "sem sprites";
+  const input = $("#catalogPageInput");
+  input.disabled = !ids.length;
+  input.max = String(pages);
+  input.value = ids.length ? String(catalogState.page + 1) : "";
+  $("#catalogPrev").disabled = catalogState.page === 0;
+  $("#catalogNext").disabled = end >= ids.length;
+
+  const grid = $("#catalogGrid");
+  grid.replaceChildren();
+  const token = ++catalogState.token;
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      observer.unobserve(entry.target);
+      fetchCatalogSprite(Number(entry.target.dataset.id)).then((sprite) => {
+        if (token === catalogState.token) drawCatalogSprite(entry.target.querySelector("canvas"), sprite, 48);
+      }).catch(() => {});
+    }
+  }, { root: grid });
+  for (let index = start; index < end; index += 1) {
+    const tile = document.createElement("button");
+    tile.className = "sprite-tile";
+    tile.dataset.id = String(ids[index]);
+    const canvas = document.createElement("canvas");
+    canvas.width = 32;
+    canvas.height = 32;
+    const label = document.createElement("span");
+    label.textContent = String(ids[index]);
+    tile.append(canvas, label);
+    grid.append(tile);
+    observer.observe(tile);
+  }
+}
+
+async function loadCatalogSprite(id) {
+  const sprite = await fetchCatalogSprite(id);
+  drawCatalogSprite($("#catalogCanvas"), sprite, Math.min(224, Math.max(sprite.width, sprite.height) * 4));
+  $("#catalogSpriteId").value = String(id);
+  $("#catalogInfo").textContent = `Sprite ${id} · ${sprite.width} × ${sprite.height} px`;
+  document.querySelectorAll("#catalogGrid .sprite-tile").forEach((tile) => {
+    tile.classList.toggle("selected", Number(tile.dataset.id) === id);
+  });
+}
+
+function gotoCatalogId(id) {
+  const index = catalogState.ids.indexOf(id);
+  if (index < 0) throw new Error(`O catálogo não tem o sprite ${id}.`);
+  const page = Math.floor(index / catalogState.pageSize);
+  if (page !== catalogState.page) {
+    catalogState.page = page;
+    renderCatalogGrid();
+  }
+  return loadCatalogSprite(id);
+}
+
+$("#catalogGrid").addEventListener("click", (event) => {
+  const tile = event.target.closest(".sprite-tile");
+  if (tile) loadCatalogSprite(Number(tile.dataset.id)).catch((error) => setMessage(error.message, "error"));
+});
+$("#catalogPrev").addEventListener("click", () => { catalogState.page -= 1; renderCatalogGrid(); });
+$("#catalogNext").addEventListener("click", () => { catalogState.page += 1; renderCatalogGrid(); });
+$("#catalogPageInput").addEventListener("change", () => {
+  const page = Number($("#catalogPageInput").value);
+  if (Number.isInteger(page) && page >= 1) catalogState.page = page - 1;
+  renderCatalogGrid();
+});
+$("#catalogGo").addEventListener("click", () => {
+  gotoCatalogId(Number($("#catalogSpriteId").value)).catch((error) => setMessage(error.message, "error"));
+});
+
+const objectsState = { category: "items", page: 0, pageSize: 60, total: 0, records: [], selected: null, token: 0, timer: null, picked: new Set(), anchor: null, clientVersion: 0, exporting: false };
+
+function applyObjectsSummary(summary) {
+  const card = $("#objectsCard");
+  card.classList.toggle("hidden", !summary.appearances);
+  if (!summary.appearances) return;
+  const counts = summary.appearances;
+  $("#objectsCount").textContent = `${counts.items} itens · ${counts.outfits} outfits · ${counts.effects} efeitos · ${counts.missiles} projéteis`;
+  objectsState.page = 0;
+  objectsState.selected = null;
+  objectsState.picked.clear();
+  updateObjectsExport();
+  refreshObjects();
+}
+
+function updateObjectsExport() {
+  const button = $("#objectsExport");
+  const count = objectsState.picked.size;
+  button.disabled = objectsState.exporting || count === 0;
+  button.textContent = count > 1 ? `Exportar ${count} (.obd em ZIP)` : "Exportar .obd";
+}
+
+function pickObject(record, event) {
+  const picked = objectsState.picked;
+  if (event.shiftKey && objectsState.anchor !== null) {
+    const ids = objectsState.records.map((item) => item.id);
+    const [from, to] = [ids.indexOf(objectsState.anchor), ids.indexOf(record.id)].sort((a, b) => a - b);
+    if (!event.ctrlKey && !event.metaKey) picked.clear();
+    if (from >= 0) ids.slice(from, to + 1).forEach((id) => picked.add(id));
+  } else if (event.ctrlKey || event.metaKey) {
+    if (!picked.delete(record.id)) picked.add(record.id);
+    objectsState.anchor = record.id;
+  } else {
+    picked.clear();
+    picked.add(record.id);
+    objectsState.anchor = record.id;
+  }
+  document.querySelectorAll("#objectsGrid .sprite-tile").forEach((tile) => {
+    tile.classList.toggle("selected", picked.has(objectsState.records[Number(tile.dataset.index)]?.id));
+  });
+  updateObjectsExport();
+}
+
+async function exportModernObd() {
+  const category = objectsState.category;
+  const ids = [...objectsState.picked].sort((a, b) => a - b);
+  if (!ids.length || objectsState.exporting) return;
+  objectsState.exporting = true;
+  updateObjectsExport();
+  const status = $("#objectsStatus");
+  const started = performance.now();
+  const results = new Array(ids.length);
+  const problems = [];
+  let finished = 0;
+  let next = 0;
+  const worker = async () => {
+    while (next < ids.length) {
+      const index = next++;
+      const query = new URLSearchParams({ category, id: String(ids[index]), clientVersion: String(objectsState.clientVersion) });
+      try {
+        const response = await api(`/api/catalog/obd?${query}`);
+        JSON.parse(decodeURIComponent(response.headers.get("x-obd-warnings") || "%5B%5D")).forEach((warning) => problems.push(warning));
+        results[index] = { name: `${category}_${ids[index]}.obd`, data: new Uint8Array(await response.arrayBuffer()) };
+      } catch (error) {
+        problems.push(`falha ${category} ${ids[index]}: ${error.message}`);
+      }
+      finished += 1;
+      status.textContent = `Exportando OBD ${finished}/${ids.length}…`;
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: Math.min(4, ids.length) }, worker));
+    const entries = results.filter(Boolean);
+    if (!entries.length) throw new Error(problems[0] ?? "nenhum objeto exportado");
+    if (entries.length === 1) downloadBytes(entries[0].data, entries[0].name, "application/octet-stream");
+    else downloadBytes(IO.buildZip(entries), `${category}_${ids[0]}-${ids.at(-1)}_obd.zip`, "application/zip");
+    const seconds = ((performance.now() - started) / 1000).toFixed(1);
+    const notes = problems.length ? ` Avisos: ${problems.slice(0, 3).join(" | ")}${problems.length > 3 ? " …" : ""}` : "";
+    const version = objectsState.clientVersion ? "" : " A versão do cliente não foi detectada pelo nome da pasta; o OBD foi gravado com versão 0.";
+    status.textContent = `${entries.length}/${ids.length} objeto(s) exportado(s) em .obd (${seconds} s).${version}${notes}`;
+  } catch (error) {
+    status.textContent = `Falha ao exportar OBD: ${error.message}`;
+  } finally {
+    objectsState.exporting = false;
+    updateObjectsExport();
+  }
+}
+$("#objectsExport").addEventListener("click", exportModernObd);
+
+async function refreshObjects() {
+  const token = ++objectsState.token;
+  const query = new URLSearchParams({
+    category: objectsState.category,
+    offset: String(objectsState.page * objectsState.pageSize),
+    limit: String(objectsState.pageSize),
+  });
+  const search = $("#objectsSearch").value.trim();
+  if (search) query.set("search", search);
+  try {
+    const result = await api(`/api/catalog/objects?${query}`);
+    if (token !== objectsState.token) return;
+    objectsState.total = result.total;
+    objectsState.records = result.records;
+    renderObjectGrid();
+  } catch (error) {
+    setMessage(error.message, "error");
+  }
+}
+
+// Sprite order inside a group: frame, depth (z), pattern Y, pattern X (direction), layer.
+function groupSpriteId(group, { frame = 0, x = 0, y = 0, z = 0, layer = 0 }) {
+  const index = ((((frame * group.patternZ + z) * group.patternY + y) * group.patternX + x) * group.layers) + layer;
+  return group.spriteIds[index] ?? 0;
+}
+
+function defaultDirection(record, group) {
+  return record.category === "outfits" && group.patternX >= 3 ? 2 : 0;
+}
+
+async function drawObject(canvas, record, group, options, box) {
+  const id = groupSpriteId(group, options);
+  if (!id) return;
+  drawCatalogSprite(canvas, await fetchCatalogSprite(id), box);
+}
+
+function renderObjectGrid() {
+  const { records, pageSize, total } = objectsState;
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  objectsState.page = Math.min(objectsState.page, pages - 1);
+  $("#objectsPageLabel").textContent = total ? `/ ${pages} · ${total} objetos` : "nenhum objeto";
+  const input = $("#objectsPageInput");
+  input.disabled = !total;
+  input.max = String(pages);
+  input.value = total ? String(objectsState.page + 1) : "";
+  $("#objectsPrev").disabled = objectsState.page === 0;
+  $("#objectsNext").disabled = objectsState.page >= pages - 1;
+  const grid = $("#objectsGrid");
+  grid.replaceChildren();
+  const token = objectsState.token;
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      observer.unobserve(entry.target);
+      const record = records[Number(entry.target.dataset.index)];
+      const group = record.groups[0];
+      if (!group || token !== objectsState.token) continue;
+      drawObject(entry.target.querySelector("canvas"), record, group, { x: defaultDirection(record, group) }, 48).catch(() => {});
+    }
+  }, { root: grid });
+  records.forEach((record, index) => {
+    const tile = document.createElement("button");
+    tile.className = `sprite-tile ${objectsState.picked.has(record.id) ? "selected" : ""}`;
+    tile.dataset.index = String(index);
+    tile.title = record.name ?? "";
+    const canvas = document.createElement("canvas");
+    canvas.width = 32;
+    canvas.height = 32;
+    const label = document.createElement("span");
+    label.textContent = String(record.id);
+    tile.append(canvas, label);
+    grid.append(tile);
+    observer.observe(tile);
+  });
+}
+
+function stopObjectAnimation() {
+  clearTimeout(objectsState.timer);
+  objectsState.timer = null;
+}
+
+function flagText(value) {
+  if (Array.isArray(value)) return value.map(flagText).join(" | ");
+  if (value !== null && typeof value === "object") return Object.entries(value).map(([key, item]) => `${key}: ${item}`).join(", ");
+  return value === true ? "sim" : String(value);
+}
+
+function selectObject(record) {
+  objectsState.selected = record;
+  stopObjectAnimation();
+  $("#objectTitle").textContent = `${record.category} #${record.id}${record.name ? ` · ${record.name}` : ""}`;
+  const groupSelect = $("#objectGroup");
+  groupSelect.replaceChildren(...record.groups.map((group, index) => new Option(`Grupo ${index + 1}${group.frames > 1 ? ` (${group.frames} frames)` : ""}`, String(index))));
+  const flags = $("#objectFlags");
+  flags.replaceChildren();
+  for (const [name, value] of Object.entries(record.flags)) {
+    const term = document.createElement("dt");
+    term.textContent = name;
+    const detail = document.createElement("dd");
+    detail.textContent = flagText(value);
+    flags.append(term, detail);
+  }
+  if (!Object.keys(record.flags).length) $("#objectFlags").textContent = "Sem flags.";
+  selectObjectGroup(0);
+}
+
+function selectObjectGroup(index) {
+  const record = objectsState.selected;
+  const group = record?.groups[index];
+  stopObjectAnimation();
+  if (!group) return;
+  const directions = $("#objectDirection");
+  const names = record.category === "outfits" && group.patternX === 4 ? ["Norte", "Leste", "Sul", "Oeste"] : [];
+  directions.replaceChildren(...Array.from({ length: group.patternX }, (_, x) => new Option(names[x] ?? `Padrão X ${x}`, String(x))));
+  directions.value = String(defaultDirection(record, group));
+  $("#objectMeta").textContent = `${group.width * 32}×${group.height * 32}px · camadas ${group.layers} · padrão ${group.patternX}×${group.patternY}×${group.patternZ} · frames ${group.frames}`;
+  $("#objectSprites").textContent = `Sprites: ${group.spriteIds.length > 24 ? `${group.spriteIds.slice(0, 24).join(", ")}… (${group.spriteIds.length})` : group.spriteIds.join(", ")}`;
+  playObject(record, group);
+}
+
+function playObject(record, group) {
+  const canvas = $("#objectCanvas");
+  const x = Number($("#objectDirection").value);
+  let frame = 0;
+  const step = async () => {
+    if (objectsState.selected !== record) return;
+    try {
+      const id = groupSpriteId(group, { frame, x });
+      if (id) {
+        const sprite = await fetchCatalogSprite(id);
+        drawCatalogSprite(canvas, sprite, Math.min(224, Math.max(sprite.width, sprite.height) * 4));
+      } else {
+        canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+      }
+    } catch {
+      // Missing sprite sheets leave the previous frame in place.
+    }
+    if (group.frames <= 1) return;
+    const [min, max] = group.animation?.phases[frame] ?? [100, 100];
+    frame = (frame + 1) % group.frames;
+    objectsState.timer = setTimeout(step, Math.max(40, (min + max) / 2));
+  };
+  step();
+}
+
+$("#objectsGrid").addEventListener("click", (event) => {
+  const tile = event.target.closest(".sprite-tile");
+  if (!tile) return;
+  const record = objectsState.records[Number(tile.dataset.index)];
+  pickObject(record, event);
+  selectObject(record);
+});
+$("#objectGroup").addEventListener("change", () => selectObjectGroup(Number($("#objectGroup").value)));
+$("#objectDirection").addEventListener("change", () => {
+  const record = objectsState.selected;
+  stopObjectAnimation();
+  if (record) playObject(record, record.groups[Number($("#objectGroup").value)]);
+});
+$("#objectsCategory").addEventListener("change", () => {
+  objectsState.category = $("#objectsCategory").value;
+  objectsState.picked.clear();
+  updateObjectsExport();
+  objectsState.page = 0;
+  refreshObjects();
+});
+let objectsSearchTimer;
+$("#objectsSearch").addEventListener("input", () => {
+  clearTimeout(objectsSearchTimer);
+  objectsSearchTimer = setTimeout(() => { objectsState.page = 0; refreshObjects(); }, 250);
+});
+$("#objectsPrev").addEventListener("click", () => { objectsState.page -= 1; refreshObjects(); });
+$("#objectsNext").addEventListener("click", () => { objectsState.page += 1; refreshObjects(); });
+$("#objectsPageInput").addEventListener("change", () => {
+  const page = Number($("#objectsPageInput").value);
+  if (Number.isInteger(page) && page >= 1) { objectsState.page = page - 1; refreshObjects(); }
 });
 
 async function createProject() {

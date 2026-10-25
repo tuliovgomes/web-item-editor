@@ -139,3 +139,14 @@ dialog.props-dialog { width: min(520px, 94vw); }
 
 .page-jump { display: inline-flex; align-items: center; gap: 6px; }
 .page-jump input { width: 5.5em; padding: 4px 6px; text-align: center; }
+
+.catalog-body { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 14px; align-items: start; }
+.catalog-grid { grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); max-height: 520px; }
+.catalog-grid .sprite-tile { align-content: start; min-height: 74px; }
+.catalog-grid .sprite-tile canvas { image-rendering: pixelated; }
+.catalog-preview { display: grid; gap: 10px; }
+.catalog-preview canvas { image-rendering: pixelated; }
+@media (max-width: 800px) { .catalog-body { grid-template-columns: 1fr; } }
+.catalog-preview h3 { margin: 0; font-size: .95rem; }
+.catalog-preview select { max-width: 50%; }
+.catalog-preview .props-list { max-height: 220px; overflow: auto; }

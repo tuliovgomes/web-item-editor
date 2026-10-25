@@ -2,7 +2,10 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { AssetProject } from "./project/project.js";
+import { buildModernObdPayload } from "./formats/obd.js";
 import { AbortedError, ObdWorkerPool } from "./project/obd-pool.js";
+import type { Appearance, AppearanceCategory } from "./formats/appearances.js";
+import { SpriteCatalog } from "./formats/catalog.js";
 import type { DatCategory } from "./formats/dat.js";
 import type { CompiledProjectFile } from "./project/project.js";
 
@@ -34,6 +37,9 @@ function sendJson(response: ServerResponse, status: number, value: unknown): voi
 
 const MAX_OBD_UPLOAD_BYTES = 8 * 1024 * 1024;
 const MAX_SPRITES_PER_REQUEST = 1024;
+const MAX_CATALOG_JSON_BYTES = 64 * 1024 * 1024;
+const MAX_APPEARANCES_BYTES = 256 * 1024 * 1024;
+const MAX_CATALOG_SHEET_BYTES = 16 * 1024 * 1024;
 const MAX_SPRITE_BATCH_BYTES = 96 * 1024 * 1024;
 
 async function readBody(request: IncomingMessage, limit: number): Promise<Buffer> {
@@ -166,6 +172,32 @@ function categoryRecord(record: ReturnType<AssetProject["list"]>[number]) {
   };
 }
 
+function modernRecord(catalog: SpriteCatalog, entry: Appearance) {
+  return {
+    id: entry.id,
+    category: entry.category,
+    name: entry.name ?? null,
+    description: entry.description ?? null,
+    flags: entry.flags,
+    groups: entry.groups.map((group) => {
+      const first = group.spriteIds.find((id) => id !== 0);
+      const size = first === undefined ? undefined : catalog.getSpriteSize(first);
+      return {
+        type: group.fixedFrameGroup,
+        width: size === undefined ? 1 : size.width / 32,
+        height: size === undefined ? 1 : size.height / 32,
+        layers: group.layers,
+        patternX: group.patternX,
+        patternY: group.patternY,
+        patternZ: group.patternZ,
+        frames: group.frames,
+        spriteIds: group.spriteIds,
+        animation: group.animation ?? null,
+      };
+    }),
+  };
+}
+
 export interface EditorServer {
   readonly server: Server;
   readonly start: (port?: number) => Promise<number>;
@@ -176,6 +208,7 @@ export function createEditorServer(): EditorServer {
   let project: AssetProject | undefined;
   let uploads: StagedUploads = {};
   let compiled: CompiledFiles | undefined;
+  let catalog: SpriteCatalog | undefined;
 
   const obdPool = new ObdWorkerPool();
   const server = createServer((request, response) => {
@@ -208,6 +241,98 @@ export function createEditorServer(): EditorServer {
         uploads[kind as UploadKind] = await readBody(request, MAX_UPLOAD_BYTES);
         compiled = undefined;
         sendJson(response, 200, { kind, bytes: uploads[kind as UploadKind]!.length });
+        return;
+      }
+
+      if (method === "POST" && url.pathname === "/api/catalog/open") {
+        const body = await readBody(request, MAX_CATALOG_JSON_BYTES);
+        catalog = new SpriteCatalog(body.toString("utf8"));
+        sendJson(response, 200, { summary: catalog.summary, files: catalog.requiredFiles });
+        return;
+      }
+
+      if (method === "POST" && url.pathname === "/api/catalog/sheet") {
+        if (catalog === undefined) throw new Error("No sprite catalog is open");
+        const name = url.searchParams.get("name") ?? "";
+        const stored = catalog.addSheet(name, await readBody(request, MAX_CATALOG_SHEET_BYTES));
+        if (!stored) throw new Error(`O catálogo não lista o arquivo "${name}"`);
+        sendJson(response, 200, { summary: catalog.summary });
+        return;
+      }
+
+      if (method === "POST" && url.pathname === "/api/catalog/appearances") {
+        if (catalog === undefined) throw new Error("No sprite catalog is open");
+        catalog.loadAppearances(await readBody(request, MAX_APPEARANCES_BYTES));
+        sendJson(response, 200, { summary: catalog.summary });
+        return;
+      }
+
+      if (method === "GET" && url.pathname === "/api/catalog/objects") {
+        if (catalog?.appearances === undefined) throw new Error("O catálogo não tem appearances.dat carregado");
+        const category = categoryFrom(url.searchParams.get("category")) as AppearanceCategory;
+        const offset = numberParam(url, "offset", 0);
+        const limit = Math.min(numberParam(url, "limit", 100), 500);
+        const matches = catalog.appearances.list(category, url.searchParams.get("search") ?? undefined);
+        sendJson(response, 200, {
+          total: matches.length,
+          offset,
+          records: matches.slice(offset, offset + limit).map((entry) => modernRecord(catalog!, entry)),
+        });
+        return;
+      }
+
+      if (method === "GET" && url.pathname === "/api/catalog/obd") {
+        if (catalog?.appearances === undefined) throw new Error("O catálogo não tem appearances.dat carregado");
+        const category = categoryFrom(url.searchParams.get("category")) as AppearanceCategory;
+        const id = numberParam(url, "id");
+        const appearance = catalog.appearances.get(category, id);
+        if (appearance === undefined) throw new Error(`Nenhum objeto ${category} com o ID ${id}`);
+        const clientVersion = numberParam(url, "clientVersion", 0);
+        if (clientVersion > 0xffff) throw new Error("clientVersion must fit in 16 bits");
+        const source = catalog;
+        const payload = buildModernObdPayload({ appearance, clientVersion, getSprite: (spriteId) => source.getSprite(spriteId) });
+        const aborter = new AbortController();
+        response.on("close", () => {
+          if (!response.writableEnded) aborter.abort();
+        });
+        let data: Buffer;
+        try {
+          data = await obdPool.compress(payload.raw, aborter.signal);
+        } catch (error) {
+          if (error instanceof AbortedError) return;
+          throw error;
+        }
+        response.writeHead(200, {
+          "content-type": "application/octet-stream",
+          "content-length": data.length,
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+          "x-obd-warnings": encodeURIComponent(JSON.stringify(payload.warnings)),
+        });
+        response.end(data);
+        return;
+      }
+
+      if (method === "GET" && url.pathname === "/api/catalog/summary") {
+        if (catalog === undefined) throw new Error("No sprite catalog is open");
+        sendJson(response, 200, { summary: catalog.summary });
+        return;
+      }
+
+      if (method === "GET" && url.pathname === "/api/catalog/sprite") {
+        if (catalog === undefined) throw new Error("No sprite catalog is open");
+        const spriteId = numberParam(url, "id");
+        const sprite = catalog.getSprite(spriteId);
+        if (sprite === undefined) throw new Error(`Nenhum sprite carregado com o ID ${spriteId}`);
+        response.writeHead(200, {
+          "content-type": "application/octet-stream",
+          "content-length": sprite.rgba.length,
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+          "x-sprite-width": String(sprite.width),
+          "x-sprite-height": String(sprite.height),
+        });
+        response.end(sprite.rgba);
         return;
       }
 

@@ -32,7 +32,7 @@
               <input id="clientVersion" type="number" min="0" value="0">
             </label>
             <p class="hint">Deixe em 0 para inferir o layout a partir do OTFI. Informe a versão manualmente se não houver OTFI ou se ela for conhecida.</p>
-            <label>Pasta do projeto (DAT, SPR e OTFI)
+            <label>Pasta do projeto (DAT, SPR e OTFI) ou do cliente moderno (catalog-content.json)
               <input id="projectFolder" type="file" webkitdirectory directory multiple>
             </label>
             <p id="folderContents" class="hint">Selecione uma pasta que contenha os arquivos do cliente.</p>
@@ -47,6 +47,70 @@
           </div>
         </div>
         <div id="message" role="status" class="message" aria-live="polite"></div>
+      </section>
+
+      <section id="objectsCard" class="card catalog-card hidden">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">APPEARANCES · SOMENTE LEITURA</p>
+            <h2>Objetos do cliente <span id="objectsCount" class="chip"></span></h2>
+          </div>
+          <div class="inline-control">
+            <select id="objectsCategory" aria-label="Categoria">
+              <option value="items">Itens</option>
+              <option value="outfits">Outfits</option>
+              <option value="effects">Efeitos</option>
+              <option value="missiles">Projéteis</option>
+            </select>
+            <input id="objectsSearch" type="search" placeholder="ID ou nome" aria-label="Buscar objeto">
+            <button id="objectsPrev" aria-label="Página anterior">←</button>
+            <span class="page-jump"><input id="objectsPageInput" type="number" min="1" step="1" inputmode="numeric" aria-label="Ir para a página de objetos" disabled> <span id="objectsPageLabel" class="hint">—</span></span>
+            <button id="objectsNext" aria-label="Próxima página">→</button>
+            <button id="objectsExport" class="primary" disabled>Exportar .obd</button>
+          </div>
+        </div>
+        <p id="objectsStatus" class="hint" role="status">Clique para selecionar; Ctrl/Shift para vários. A exportação gera .obd (um arquivo, ou ZIP se forem vários).</p>
+        <div class="catalog-body">
+          <div id="objectsGrid" class="sprite-grid catalog-grid" tabindex="0" aria-label="Objetos do cliente"></div>
+          <div class="catalog-preview">
+            <h3 id="objectTitle">Selecione um objeto</h3>
+            <div class="inline-control">
+              <select id="objectGroup" aria-label="Grupo de frames"></select>
+              <select id="objectDirection" aria-label="Direção"></select>
+            </div>
+            <div class="canvas-frame"><canvas id="objectCanvas" width="32" height="32"></canvas></div>
+            <p id="objectMeta" class="hint"></p>
+            <dl id="objectFlags" class="props-list"></dl>
+            <p id="objectSprites" class="hint"></p>
+          </div>
+        </div>
+      </section>
+
+      <section id="catalogCard" class="card catalog-card hidden">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">CATÁLOGO · SOMENTE LEITURA</p>
+            <h2>Sprites do cliente <span id="catalogCount" class="chip"></span></h2>
+          </div>
+          <div class="inline-control">
+            <button id="catalogPrev" aria-label="Sprites anteriores">←</button>
+            <span class="page-jump"><input id="catalogPageInput" type="number" min="1" step="1" inputmode="numeric" aria-label="Ir para a página do catálogo" disabled> <span id="catalogPageLabel" class="hint">—</span></span>
+            <button id="catalogNext" aria-label="Próximos sprites">→</button>
+          </div>
+        </div>
+        <div class="catalog-body">
+          <div id="catalogGrid" class="sprite-grid catalog-grid" tabindex="0" aria-label="Sprites do catálogo"></div>
+          <div class="catalog-preview">
+            <label>Ir para o ID
+              <div class="inline-control">
+                <input id="catalogSpriteId" type="number" min="0" value="0">
+                <button id="catalogGo">Carregar</button>
+              </div>
+            </label>
+            <div class="canvas-frame"><canvas id="catalogCanvas" width="32" height="32"></canvas></div>
+            <p id="catalogInfo" class="hint">Selecione um sprite.</p>
+          </div>
+        </div>
       </section>
 
       <section id="workspace" class="workspace hidden">

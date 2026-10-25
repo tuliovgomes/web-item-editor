@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { compress, decompress } from "lzma";
+import type { Appearance, FlagValue } from "./appearances.js";
 import type { DatCategory, DatGroupSpec, DatRecordView } from "./dat.js";
 
 /**
@@ -250,6 +251,176 @@ export function buildObdPayload(input: ObdEncodeInput): ObdPayload {
     output.raw(argb);
   }
   return { raw: output.toBuffer(), warnings, spriteCount: group.spriteIds.length };
+}
+
+const MODERN_BOOLEAN_FLAGS: readonly (readonly [string, string])[] = [
+  ["clip", "isGroundBorder"], ["bottom", "isOnBottom"], ["top", "isOnTop"], ["container", "isContainer"],
+  ["cumulative", "isStackable"], ["usable", "usable"], ["forceuse", "forceUse"], ["multiuse", "isUseable"],
+  ["liquidpool", "isFluid"], ["liquidcontainer", "isFluidContainer"], ["unpass", "isUnpassable"],
+  ["unmove", "isUnmoveable"], ["unsight", "blocksMissiles"], ["avoid", "blocksPathfinder"],
+  ["noMovementAnimation", "noMoveAnimation"], ["take", "isPickupable"], ["hang", "isHangable"],
+  ["rotate", "isRotatable"], ["dontHide", "dontHide"], ["translucent", "isTranslucent"],
+  ["lyingObject", "isLyingObject"], ["animateAlways", "animateAlways"], ["fullbank", "fullGround"],
+  ["ignoreLook", "ignoreLook"], ["wrap", "wrappable"], ["unwrap", "unwrappable"], ["topeffect", "topEffect"],
+];
+
+/** Maps modern AppearanceFlags to the editor property names that `writeProperties` understands. */
+function modernProperties(flags: Appearance["flags"]): Record<string, PropertyValue> {
+  const properties: Record<string, PropertyValue> = {};
+  const group = (name: string): Readonly<Record<string, FlagValue>> | undefined => {
+    const value = flags[name];
+    return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Readonly<Record<string, FlagValue>> : undefined;
+  };
+  const numeric = (value: FlagValue | undefined): number => (typeof value === "number" ? value : 0);
+  for (const [modern, editor] of MODERN_BOOLEAN_FLAGS) if (flags[modern] === true) properties[editor] = true;
+
+  const bank = group("bank");
+  if (bank !== undefined) { properties["isGround"] = true; properties["groundSpeed"] = numeric(bank["waypoints"]); }
+  const write = group("write");
+  const writeOnce = group("writeOnce");
+  if (write !== undefined || writeOnce !== undefined) {
+    properties["isWritable"] = true;
+    properties["writableOnce"] = writeOnce !== undefined;
+    properties["maxTextLength"] = numeric((writeOnce ?? write)?.[writeOnce !== undefined ? "maxTextLengthOnce" : "maxTextLength"]);
+  }
+  const hook = group("hook");
+  if (flags["hookSouth"] === true || (hook !== undefined && hook["south"] !== undefined)) properties["isVertical"] = true;
+  if (flags["hookEast"] === true || (hook !== undefined && hook["east"] !== undefined)) properties["isHorizontal"] = true;
+  const light = group("light");
+  if (light !== undefined) {
+    properties["hasLight"] = true;
+    properties["lightLevel"] = numeric(light["brightness"]);
+    properties["lightColor"] = numeric(light["color"]);
+  }
+  const shift = group("shift");
+  if (shift !== undefined) { properties["hasOffset"] = true; properties["offsetX"] = numeric(shift["x"]); properties["offsetY"] = numeric(shift["y"]); }
+  const height = group("height");
+  if (height !== undefined) { properties["hasElevation"] = true; properties["elevation"] = numeric(height["elevation"]); }
+  const automap = group("automap");
+  if (automap !== undefined) { properties["hasMinimapColor"] = true; properties["minimapColor"] = numeric(automap["color"]); }
+  const lens = group("lenshelp");
+  if (lens !== undefined) properties["lensHelp"] = numeric(lens["id"]);
+  const clothes = group("clothes");
+  if (clothes !== undefined) { properties["hasCloth"] = true; properties["clothSlot"] = numeric(clothes["slot"]); }
+  const action = group("defaultAction");
+  if (action !== undefined) { properties["hasAction"] = true; properties["defaultAction"] = numeric(action["action"]); }
+  const market = group("market");
+  if (market !== undefined) {
+    properties["hasMarket"] = true;
+    properties["marketCategory"] = numeric(market["category"]);
+    properties["marketTradeAs"] = numeric(market["tradeAsObjectId"]);
+    properties["marketShowAs"] = numeric(market["showAsObjectId"]);
+    properties["marketName"] = typeof market["name"] === "string" ? market["name"] : "";
+    properties["marketLevel"] = numeric(market["minimumLevel"]);
+  }
+  return properties;
+}
+
+export interface ModernObdInput {
+  readonly appearance: Appearance;
+  readonly clientVersion: number;
+  /** Returns the sprite's RGBA pixels and size, or undefined when it is missing. */
+  readonly getSprite: (id: number) => { width: number; height: number; rgba: Buffer } | undefined;
+}
+
+const MODERN_LOST_FLAGS = ["npcSaleData", "changedToExpire", "cyclopediaItem", "upgradeClassification", "skillwheelGem", "imbueable", "proficiency", "transparencyLevel", "weaponType"];
+
+/**
+ * Builds an OBD v2 payload from a modern appearance. OBD only stores 32x32 sprites, so each
+ * 64-pixel sprite is cut into 32x32 cells, ordered as the legacy DAT does (frame, z, y, x, layer,
+ * then cell row and column, with column 0 at the right edge of the image).
+ */
+export function buildModernObdPayload(input: ModernObdInput): ObdPayload {
+  const { appearance, clientVersion } = input;
+  const group = appearance.groups[0];
+  if (group === undefined) throw new ObdFormatError("O objeto não tem grupo de frames");
+  const warnings: string[] = [];
+  const label = `${appearance.category} ${appearance.id}`;
+  if (appearance.groups.length > 1) warnings.push(`${label}: OBD v2 guarda um grupo de frames; ${appearance.groups.length - 1} grupo(s) adicional(is) foram omitidos.`);
+  const lost = MODERN_LOST_FLAGS.filter((name) => appearance.flags[name] !== undefined);
+  if (lost.length > 0) warnings.push(`${label}: flags sem equivalente no OBD v2 foram omitidas (${lost.join(", ")}).`);
+
+  let cellsWide = 1;
+  let cellsHigh = 1;
+  for (const id of group.spriteIds) {
+    const sprite = id === 0 ? undefined : input.getSprite(id);
+    if (sprite !== undefined) {
+      cellsWide = Math.max(1, sprite.width / OBD_SPRITE_SIZE);
+      cellsHigh = Math.max(1, sprite.height / OBD_SPRITE_SIZE);
+      break;
+    }
+  }
+  const cellCount = group.spriteIds.length * cellsWide * cellsHigh;
+  if (cellCount > MAX_OBD_SPRITES) throw new ObdFormatError(`OBD suporta no máximo ${MAX_OBD_SPRITES} sprites por objeto (este precisaria de ${cellCount})`);
+  if (group.patternX > 255 || group.patternY > 255 || group.patternZ > 255 || group.layers > 255 || group.frames > 255) {
+    throw new ObdFormatError("O padrão do objeto excede os limites do OBD");
+  }
+
+  const output = new Writer();
+  output.u16(OBD_VERSION_2);
+  output.u16(clientVersion);
+  output.u8(CATEGORY_VALUES[appearance.category]);
+  const patternsPosition = output.length;
+  output.u32(0);
+  writeProperties(output, modernProperties(appearance.flags));
+  output.patchU32(patternsPosition, output.length);
+
+  output.u8(cellsWide);
+  output.u8(cellsHigh);
+  if (cellsWide > 1 || cellsHigh > 1) output.u8(Math.max(cellsWide, cellsHigh) * OBD_SPRITE_SIZE);
+  output.u8(group.layers);
+  output.u8(group.patternX);
+  output.u8(group.patternY);
+  output.u8(group.patternZ);
+  output.u8(group.frames);
+  if (group.frames > 1) {
+    const animation = group.animation;
+    output.u8(animation?.synchronized === true ? 1 : 0);
+    output.u32(animation === undefined || animation.loopType === 0 ? 0 : animation.loopType < 0 ? 0xffffffff : animation.loopCount);
+    output.u8(animation?.randomStartPhase === true ? 0xff : (animation?.defaultStartPhase ?? 0));
+    for (let frame = 0; frame < group.frames; frame += 1) {
+      const phase = animation?.phases[frame];
+      output.u32(phase?.[0] ?? 500);
+      output.u32(phase?.[1] ?? 500);
+    }
+  }
+
+  const cells: Buffer[] = [];
+  const empty = Buffer.alloc(OBD_PIXEL_BYTES);
+  for (const spriteId of group.spriteIds) {
+    const sprite = spriteId === 0 ? undefined : input.getSprite(spriteId);
+    if (sprite !== undefined && (sprite.width !== cellsWide * OBD_SPRITE_SIZE || sprite.height !== cellsHigh * OBD_SPRITE_SIZE)) {
+      throw new ObdFormatError(`Sprite ${spriteId} tem tamanho diferente das outras sprites do objeto`);
+    }
+    for (let row = 0; row < cellsHigh; row += 1) {
+      for (let column = 0; column < cellsWide; column += 1) {
+        if (sprite === undefined) { cells.push(empty); continue; }
+        const cell = Buffer.alloc(OBD_PIXEL_BYTES);
+        const left = (cellsWide - 1 - column) * OBD_SPRITE_SIZE;
+        const top = (cellsHigh - 1 - row) * OBD_SPRITE_SIZE;
+        for (let y = 0; y < OBD_SPRITE_SIZE; y += 1) {
+          const start = ((top + y) * sprite.width + left) * 4;
+          sprite.rgba.copy(cell, y * OBD_SPRITE_SIZE * 4, start, start + OBD_SPRITE_SIZE * 4);
+        }
+        cells.push(cell);
+      }
+    }
+  }
+  for (const [index, source] of cells.entries()) {
+    const blank = source === empty || source.every((byte, offset) => offset % 4 !== 3 || byte === 0);
+    const argb = Buffer.alloc(OBD_PIXEL_BYTES);
+    if (!blank) {
+      for (let offset = 0; offset < OBD_PIXEL_BYTES; offset += 4) {
+        argb[offset] = source[offset + 3]!;
+        argb[offset + 1] = source[offset]!;
+        argb[offset + 2] = source[offset + 1]!;
+        argb[offset + 3] = source[offset + 2]!;
+      }
+    }
+    output.u32(blank ? 0 : index + 1);
+    output.raw(argb);
+  }
+  return { raw: output.toBuffer(), warnings, spriteCount: cells.length };
 }
 
 export interface ObdThing {
