@@ -1,11 +1,19 @@
+# Development setup: the source is mounted into the container, so edits on the host show up without a rebuild.
+# - web/ changes reach the open page through the live-reload stream (CSS in place, JS/HTML with state restored);
+# - src/ changes restart the server (scripts/dev-watch.cjs), and the page reopens the project from its folder.
+# Rebuild (`docker compose up -d --build`) only after changing package.json/package-lock.json.
 services:
   oteditor:
     build: .
     image: oteditor-ts:dev
-    command: ["npm", "run", "start"]
+    command: ["node", "scripts/dev-watch.cjs"]
     environment:
       HOST: 0.0.0.0
       PORT: 4173
     ports:
       - "127.0.0.1:4173:4173"
+    volumes:
+      - ./src:/app/src:ro
+      - ./web:/app/web:ro
+      - ./scripts:/app/scripts:ro
     restart: unless-stopped

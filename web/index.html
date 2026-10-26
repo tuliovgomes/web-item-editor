@@ -5,8 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>OTEditor — Editor local</title>
+    <link rel="stylesheet" href="/vendor/sweetalert2.min.css">
     <link rel="stylesheet" href="/app.css">
+    <script src="/vendor/sweetalert2.min.js" defer></script>
+    <script src="/dialogs.js" defer></script>
     <script src="/sprite-io.js" defer></script>
+    <script src="/folder-sync.js" defer></script>
     <script src="/app.js" defer></script>
   </head>
   <body>
@@ -15,7 +19,10 @@
         <p class="eyebrow">OPEN TIBIA ASSET TOOLING</p>
         <h1>OTEditor <span>local</span></h1>
       </div>
-      <div id="projectStatus" class="status-pill">Nenhum projeto aberto</div>
+      <div class="topbar-status">
+        <span id="watchStatus" class="status-pill hidden" title="O editor monitora os arquivos da pasta e recarrega o projeto quando eles mudam fora dele."></span>
+        <div id="projectStatus" class="status-pill">Nenhum projeto aberto</div>
+      </div>
     </header>
 
     <main>
@@ -32,14 +39,21 @@
               <input id="clientVersion" type="number" min="0" value="0">
             </label>
             <p class="hint">Deixe em 0 para inferir o layout a partir do OTFI. Informe a versão manualmente se não houver OTFI ou se ela for conhecida.</p>
-            <label>Pasta do projeto (DAT, SPR e OTFI) ou do cliente moderno (catalog-content.json)
+            <div id="folderPicker" class="form-stack hidden">
+              <span class="field-label">Pasta do projeto (DAT, SPR e OTFI) ou do cliente moderno (catalog-content.json)</span>
+              <div class="inline-control">
+                <button id="pickFolder" type="button">Escolher pasta…</button>
+                <span id="pickedFolder" class="hint">Nenhuma pasta escolhida.</span>
+              </div>
+            </div>
+            <label id="folderInputLabel">Pasta do projeto (DAT, SPR e OTFI) ou do cliente moderno (catalog-content.json)
               <input id="projectFolder" type="file" webkitdirectory directory multiple>
             </label>
             <p id="folderContents" class="hint">Selecione uma pasta que contenha os arquivos do cliente.</p>
             <button id="openProject" class="primary">Abrir pasta selecionada</button>
           </div>
           <div class="form-stack create-box">
-            <p>Ou comece um conjunto vazio. Os arquivos-fonte nunca são sobrescritos; a compilação é baixada como novos arquivos.</p>
+            <p>Ou comece um conjunto vazio. Sem pasta de destino, a compilação é baixada como novos arquivos.</p>
             <label>Assinatura DAT/SPR (inteiro sem sinal)
               <input id="signature" type="number" min="0" max="4294967295" value="1">
             </label>
@@ -192,7 +206,8 @@
         <div>
           <p class="eyebrow">SAÍDA</p>
           <h2>Compilar conjunto DAT + SPR + OTFI</h2>
-          <p>O projeto é serializado, reaberto e validado antes de disponibilizar os arquivos para download.</p>
+          <p>O projeto é serializado, reaberto e validado. Só depois disso os arquivos DAT, SPR e OTFI abertos são substituídos na pasta selecionada; os demais arquivos da pasta não são tocados.</p>
+          <p id="compileTarget" class="hint"></p>
         </div>
         <button id="compileProject" class="primary">Validar e compilar</button>
         <div id="downloads" class="downloads"></div>

@@ -1,7 +1,9 @@
 const $ = (selector) => document.querySelector(selector);
+const FS = globalThis.FolderSync;
 
 const state = {
   summary: null,
+  savedRevision: null, // server revision that matches the files on disk (set on open, reload and save)
   selected: null,
   page: 0,
   pageSize: 100,
@@ -54,13 +56,21 @@ async function api(path, options = {}) {
   return contentType.includes("json") ? response.json() : response;
 }
 
-function setMessage(message, kind = "") {
+/**
+ * Writes the status line (always) and, unless `popup` is false, surfaces the outcome through SweetAlert2:
+ * errors as a modal alert and successes as a toast. Plain progress messages (no kind) stay in the status line.
+ * Flows that show their own SweetAlert2 dialog pass `popup: false` so the user is not notified twice.
+ */
+function setMessage(message, kind = "", { popup = true } = {}) {
   const element = $("#message");
   element.textContent = message;
   element.className = `message ${kind}`;
   const modal = $("#modalMessage");
   modal.textContent = message;
   modal.className = `message ${kind}`;
+  if (!popup) return;
+  if (kind === "error") Dialogs.error("Não foi possível concluir a operação", { text: message });
+  else if (kind === "success") Dialogs.toast(message);
 }
 
 function setBusy(button, busy, busyText = "Processando…") {
@@ -73,82 +83,152 @@ function currentCategory() {
   return $("#category").value;
 }
 
-async function uploadFile(kind, file) {
-  return api(`/api/upload?kind=${kind}`, {
+async function uploadFile(kind, file, session = "") {
+  return api(`/api/upload?kind=${kind}&session=${session}`, {
     method: "POST",
     headers: { "content-type": "application/octet-stream" },
     body: file,
   });
 }
 
-function findProjectFiles(files) {
-  const candidates = { dat: [], spr: [], otfi: [] };
-  for (const file of files) {
-    const relativePath = file.webkitRelativePath || file.name;
-    const filename = relativePath.split("/").at(-1);
-    const match = /^(.+)\.(dat|spr|otfi)$/i.exec(filename);
-    if (match) candidates[match[2].toLowerCase()].push({ file, stem: match[1].toLowerCase() });
+/* Project folder. With the File System Access API (Chromium) the folder is opened with a read/write handle, so
+   "Validar e compilar" can replace the opened files in place and the folder can be watched for external edits.
+   Other browsers fall back to <input webkitdirectory>, which is read-only: compiled files are then downloaded. */
+
+const supportsFolderAccess = typeof globalThis.showDirectoryPicker === "function";
+const folderState = {
+  root: null, // FileSystemDirectoryHandle of the picked folder (null with the <input> fallback)
+  entries: [], // { name, path, file? , handle?, dir? } for every relevant file found in the folder
+  project: null, // { dat, spr, otfi? } entries of the open project, when they can be written back
+  watcher: null,
+  watchErrorAt: 0,
+};
+const projectLock = { name: null };
+
+if (supportsFolderAccess) {
+  $("#folderPicker").classList.remove("hidden");
+  $("#folderInputLabel").classList.add("hidden");
+}
+
+/** Runs `work` unless another folder operation (open, reload, save) is in progress. */
+async function withProjectLock(name, work) {
+  if (projectLock.name) throw new Error(`Aguarde: ${projectLock.name} em andamento.`);
+  projectLock.name = name;
+  try {
+    return await work();
+  } finally {
+    projectLock.name = null;
   }
+}
 
-  if (!candidates.dat.length || !candidates.spr.length) {
-    throw new Error("A pasta selecionada precisa conter um arquivo .dat e um arquivo .spr.");
+async function scanDirectory(directory, prefix = directory.name, found = []) {
+  for await (const [name, handle] of directory.entries()) {
+    if (handle.kind === "directory") {
+      if (!FS.isSkippedDirectory(name)) await scanDirectory(handle, `${prefix}/${name}`, found);
+    } else if (FS.isRelevantName(name)) {
+      found.push({ name, path: `${prefix}/${name}`, handle, dir: directory, dirPath: prefix });
+    }
   }
+  return found;
+}
 
-  const matchingPairs = candidates.dat.flatMap((dat) =>
-    candidates.spr.filter((spr) => spr.stem === dat.stem).map((spr) => ({ dat, spr })),
-  );
-  let selectedPair;
-  if (matchingPairs.length === 1) {
-    selectedPair = matchingPairs[0];
-  } else if (candidates.dat.length === 1 && candidates.spr.length === 1) {
-    selectedPair = { dat: candidates.dat[0], spr: candidates.spr[0] };
-  } else {
-    throw new Error("Encontrei mais de um DAT/SPR. Deixe apenas um par na pasta ou use nomes correspondentes.");
+function entryFile(entry) {
+  return entry.file ?? entry.handle.getFile();
+}
+
+function describeFolder(entries) {
+  if (!entries.length) return "Nenhum arquivo DAT/SPR/OTFI ou catalog-content.json nesta pasta.";
+  const catalog = FS.findCatalogEntry(entries);
+  if (catalog) {
+    const sheets = entries.filter((entry) => /^sprites-.+\.bmp\.lzma$/i.test(entry.name)).length;
+    return `${catalog.name} · ${sheets} folhas de sprites (cliente moderno)`;
   }
+  try {
+    const selected = FS.findProjectFiles(entries);
+    return [selected.dat.path, selected.spr.path, selected.otfi?.path ?? "OTFI não encontrado (opcional)"].join(" · ");
+  } catch (error) {
+    return error.message;
+  }
+}
 
-  const matchingOtfi = candidates.otfi.filter((entry) => entry.stem === selectedPair.dat.stem);
-  let otfi;
-  if (matchingOtfi.length === 1) otfi = matchingOtfi[0].file;
-  else if (matchingOtfi.length > 1 || (!matchingOtfi.length && candidates.otfi.length > 1)) {
-    throw new Error("Encontrei mais de um OTFI. Deixe apenas um OTFI correspondente ao DAT.");
-  } else if (candidates.otfi.length === 1) otfi = candidates.otfi[0].file;
+async function pickFolder() {
+  let root;
+  try {
+    root = await globalThis.showDirectoryPicker({ id: "oteditor-project", mode: "readwrite" });
+  } catch (error) {
+    if (error?.name === "AbortError") return;
+    Dialogs.error("Não foi possível abrir a pasta", { text: error.message });
+    return;
+  }
+  const button = $("#pickFolder");
+  try {
+    setBusy(button, true, "Lendo pasta…");
+    folderState.root = root;
+    folderState.entries = await scanDirectory(root);
+    $("#pickedFolder").textContent = root.name;
+    $("#folderContents").textContent = describeFolder(folderState.entries);
+  } catch (error) {
+    folderState.root = null;
+    folderState.entries = [];
+    Dialogs.error("Não foi possível ler a pasta", { text: error.message });
+  } finally {
+    setBusy(button, false);
+  }
+}
 
-  return { dat: selectedPair.dat.file, spr: selectedPair.spr.file, otfi };
+$("#pickFolder").addEventListener("click", pickFolder);
+
+/**
+ * Uploads the chosen DAT/SPR/OTFI and opens them on the server; returns the open result. Each call stages its
+ * files under its own session, so another tab opening at the same moment cannot swap in its own DAT or SPR.
+ */
+async function uploadAndOpen(picked) {
+  const session = crypto.randomUUID();
+  const dat = await entryFile(picked.dat);
+  const spr = await entryFile(picked.spr);
+  const otfi = picked.otfi ? await entryFile(picked.otfi) : undefined;
+  setMessage(`Enviando ${dat.name}…`);
+  await uploadFile("dat", dat, session);
+  setMessage(`Enviando ${spr.name} (${formatBytes(spr.size)})…`);
+  await uploadFile("spr", spr, session);
+  if (otfi) {
+    setMessage(`Enviando ${otfi.name}…`);
+    await uploadFile("otfi", otfi, session);
+  }
+  const version = Number($("#clientVersion").value);
+  return api(`/api/project/open?clientVersion=${encodeURIComponent(version)}&session=${session}`, { method: "POST" });
 }
 
 async function openProject() {
   const button = $("#openProject");
   try {
-    setBusy(button, true, "Lendo arquivos…");
-    const selectedFiles = $("#projectFolder").files;
-    if (!selectedFiles.length) throw new Error("Selecione a pasta do projeto.");
-    if (findCatalogFile(selectedFiles)) {
-      await openCatalog(selectedFiles);
-      return;
-    }
-    const { dat, spr, otfi } = findProjectFiles(selectedFiles);
-    setMessage(`Enviando ${dat.name}…`);
-    await uploadFile("dat", dat);
-    setMessage(`Enviando ${spr.name} (${formatBytes(spr.size)})…`);
-    await uploadFile("spr", spr);
-    if (otfi) {
-      setMessage(`Enviando ${otfi.name}…`);
-      await uploadFile("otfi", otfi);
-    }
-    const version = Number($("#clientVersion").value);
-    const result = await api(`/api/project/open?clientVersion=${encodeURIComponent(version)}`, { method: "POST" });
-    state.selected = null;
-    state.page = 0;
-    thumbCache.clear();
-    state.sprites.rendered = false;
-    state.sprites.selected.clear();
-    state.sprites.page = 0;
-    applySummary(result.summary);
-    const warnings = result.summary.warnings ?? [];
-    setMessage(
-      warnings.length ? `Projeto aberto com aviso: ${warnings.join(" ")}` : "Projeto aberto. Os arquivos ficam somente na memória do editor local.",
-      warnings.length ? "" : "success",
-    );
+    await withProjectLock("abertura do projeto", async () => {
+      setBusy(button, true, "Lendo arquivos…");
+      const entries = folderState.entries;
+      if (!entries.length) {
+        throw new Error(supportsFolderAccess ? "Escolha a pasta do projeto." : "Selecione a pasta do projeto.");
+      }
+      if (FS.findCatalogEntry(entries)) {
+        await openCatalog(entries);
+        stopWatching();
+        folderState.project = null;
+        return;
+      }
+      const picked = FS.findProjectFiles(entries);
+      const result = await uploadAndOpen(picked);
+      stopWatching();
+      // Only handle-backed files (File System Access API) can be replaced in place.
+      folderState.project = picked.dat.handle && picked.spr.handle ? picked : null;
+      startProject(result.summary);
+      updateCompileTarget();
+      const warnings = result.summary.warnings ?? [];
+      setMessage(
+        warnings.length ? `Projeto aberto com aviso: ${warnings.join(" ")}` : "Projeto aberto.",
+        warnings.length ? "" : "success",
+      );
+      if (folderState.project) await startWatching();
+      rememberFolder();
+    });
   } catch (error) {
     setMessage(error.message, "error");
   } finally {
@@ -157,46 +237,181 @@ async function openProject() {
 }
 
 $("#projectFolder").addEventListener("change", () => {
-  const files = $("#projectFolder").files;
-  if (!files.length) {
-    $("#folderContents").textContent = "Selecione uma pasta que contenha os arquivos do cliente.";
-    return;
-  }
-  const catalogFile = findCatalogFile(files);
-  if (catalogFile) {
-    const sheets = [...files].filter((file) => /^sprites-.+\.bmp\.lzma$/i.test(file.name)).length;
-    $("#folderContents").textContent = `${catalogFile.name} · ${sheets} folhas de sprites (cliente moderno)`;
-    return;
-  }
-  try {
-    const selected = findProjectFiles(files);
-    $("#folderContents").textContent = [
-      selected.dat.name,
-      selected.spr.name,
-      selected.otfi?.name ?? "OTFI não encontrado (opcional)",
-    ].join(" · ");
-  } catch (error) {
-    $("#folderContents").textContent = error.message;
-  }
+  const files = [...$("#projectFolder").files];
+  folderState.root = null;
+  folderState.entries = files
+    .filter((file) => FS.isRelevantName(file.name))
+    .map((file) => ({ name: file.name, path: file.webkitRelativePath || file.name, file }));
+  $("#folderContents").textContent = files.length
+    ? describeFolder(folderState.entries)
+    : "Selecione uma pasta que contenha os arquivos do cliente.";
 });
 
-function findCatalogFile(files) {
-  return [...files].find((file) => file.name === "catalog-content.json");
+/* Compile destination and external-change watching */
+
+function updateCompileTarget() {
+  const target = folderState.project;
+  $("#compileTarget").textContent = target
+    ? `Destino: ${[target.dat, target.spr, target.otfi].filter(Boolean).map((entry) => entry.path).join(" · ")}`
+    : supportsFolderAccess
+      ? "Sem pasta de destino: abra o projeto com “Escolher pasta…” para gravar nela. Sem isso, os arquivos compilados são apenas baixados."
+      : "Este navegador não permite gravar na pasta (use Chrome ou Edge). Os arquivos compilados são baixados.";
 }
+
+function hasUnsavedChanges() {
+  return state.summary !== null && state.summary.revision !== state.savedRevision;
+}
+
+/** Directories that hold the open project's files; only these are listed on each poll (never recursively). */
+function watchedDirectories() {
+  const dirs = new Map();
+  for (const entry of [folderState.project?.dat, folderState.project?.spr, folderState.project?.otfi]) {
+    if (entry?.dir) dirs.set(entry.dirPath, entry.dir);
+  }
+  return dirs;
+}
+
+async function listProjectDirectories() {
+  const entries = [];
+  for (const [dirPath, dir] of watchedDirectories()) {
+    for await (const [name, handle] of dir.entries()) {
+      if (handle.kind === "file" && /\.(dat|spr|otfi)$/i.test(name)) {
+        entries.push({ name, path: `${dirPath}/${name}`, handle, dir, dirPath });
+      }
+    }
+  }
+  return entries;
+}
+
+async function readFolderSnapshot() {
+  const entries = await listProjectDirectories();
+  const files = [];
+  for (const entry of entries) {
+    try {
+      const file = await entry.handle.getFile();
+      files.push({ name: entry.path, size: file.size, lastModified: file.lastModified });
+    } catch (error) {
+      // Deleted between the listing and the read: it is reported as removed by the next poll.
+      if (error?.name !== "NotFoundError") throw error;
+    }
+  }
+  return FS.makeSnapshot(files);
+}
+
+function setWatchStatus(text, kind = "watching") {
+  const chip = $("#watchStatus");
+  chip.textContent = text;
+  chip.className = `status-pill ${kind}`;
+  chip.classList.toggle("hidden", !text);
+}
+
+async function startWatching() {
+  stopWatching();
+  if (!folderState.project) return;
+  const watcher = FS.createChangeWatcher({
+    readSnapshot: readFolderSnapshot,
+    onChange: handleExternalChange,
+    onError: handleWatchError,
+  });
+  folderState.watcher = watcher;
+  watcher.start(await readFolderSnapshot());
+  setWatchStatus("● monitorando pasta");
+}
+
+function stopWatching() {
+  folderState.watcher?.stop();
+  folderState.watcher = null;
+  setWatchStatus("");
+}
+
+function handleWatchError(error) {
+  if (error?.name === "NotAllowedError" || error?.name === "SecurityError") {
+    stopWatching();
+    setWatchStatus("monitoramento parado", "watch-error");
+    Dialogs.warning("Monitoramento da pasta interrompido", {
+      text: "O navegador retirou a permissão de acesso à pasta. Abra a pasta novamente para voltar a monitorá-la.",
+    });
+    return;
+  }
+  setWatchStatus("● erro ao ler a pasta", "watch-error");
+  const now = Date.now();
+  if (now - folderState.watchErrorAt > 30_000) {
+    folderState.watchErrorAt = now;
+    setMessage(`Não foi possível verificar a pasta: ${error?.message ?? error}. Nova tentativa em instantes.`, "error", { popup: false });
+  }
+}
+
+async function handleExternalChange(next, previous) {
+  if (projectLock.name || importState.running) {
+    // A save, reload or import owns the project right now; look again once it is done.
+    folderState.watcher?.acknowledge(previous);
+    return;
+  }
+  setWatchStatus("● monitorando pasta");
+  const { added, changed, removed } = FS.diffSnapshots(previous, next);
+  const lines = [
+    ...changed.map((name) => `alterado: ${name}`),
+    ...added.map((name) => `novo: ${name}`),
+    ...removed.map((name) => `removido: ${name}`),
+  ];
+  let picked;
+  try {
+    picked = FS.findProjectFiles(await listProjectDirectories());
+  } catch (error) {
+    await Dialogs.warning("Arquivos do projeto indisponíveis", {
+      html: `<p>${Dialogs.escapeHtml(error.message)}</p>${Dialogs.list(lines)}<p>O projeto continua aberto na memória do editor.</p>`,
+    });
+    return;
+  }
+  if (hasUnsavedChanges()) {
+    const reload = await Dialogs.confirm({
+      title: "Arquivos alterados fora do editor",
+      html: `${Dialogs.list(lines)}<p>Recarregar descarta as alterações ainda não gravadas na pasta.</p>`,
+      confirmText: "Recarregar e descartar",
+      cancelText: "Manter minhas alterações",
+      danger: true,
+    });
+    if (!reload) {
+      setMessage("Mudança externa ignorada; suas alterações continuam no editor.");
+      return;
+    }
+  }
+  try {
+    await withProjectLock("recarga do projeto", () => reloadProject(picked));
+    Dialogs.toast(`Projeto recarregado (${lines.length} alteração(ões) na pasta).`, "info");
+  } catch (error) {
+    Dialogs.error("Falha ao recarregar o projeto", {
+      text: `${error.message}. O projeto anterior continua aberto.`,
+    });
+  }
+}
+
+/** Re-opens the folder's files and keeps the category, pages, selections, viewed sprite and open record. */
+async function reloadProject(picked) {
+  const result = await uploadAndOpen(picked);
+  folderState.project = picked;
+  rememberFolder();
+  updateCompileTarget();
+  startProject(result.summary, { preserve: true });
+  setMessage("Projeto recarregado da pasta.", "", { popup: false });
+}
+
+window.addEventListener("focus", () => folderState.watcher?.checkSoon());
 
 const catalogState = { ids: new Int32Array(0), page: 0, pageSize: 120, cache: new Map(), token: 0 };
 const CATALOG_UPLOAD_CONCURRENCY = 6;
 const CATALOG_CACHE_LIMIT = 2000;
 
-async function openCatalog(selectedFiles) {
+async function openCatalog(entries) {
   setMessage("Lendo catalog-content.json…");
+  const catalogEntry = FS.findCatalogEntry(entries);
   const opened = await api("/api/catalog/open", {
     method: "POST",
     headers: { "content-type": "application/octet-stream" },
-    body: findCatalogFile(selectedFiles),
+    body: await entryFile(catalogEntry),
   });
-  const byName = new Map([...selectedFiles].map((file) => [file.name, file]));
-  const folderVersion = (findCatalogFile(selectedFiles).webkitRelativePath || "").split("/").at(-2) ?? "";
+  const byName = new Map(entries.map((entry) => [entry.name, entry]));
+  const folderVersion = catalogEntry.path.split("/").at(-2) ?? "";
   objectsState.clientVersion = /^\d{3,5}$/.test(folderVersion) ? Number(folderVersion) : 0;
   const missing = opened.files.filter((name) => !byName.has(name));
   if (missing.length === opened.files.length) {
@@ -210,7 +425,7 @@ async function openCatalog(selectedFiles) {
       await api(`/api/catalog/sheet?name=${encodeURIComponent(name)}`, {
         method: "POST",
         headers: { "content-type": "application/octet-stream" },
-        body: byName.get(name),
+        body: await entryFile(byName.get(name)),
       });
       done += 1;
       if (done % 50 === 0 || !queue.length) setMessage(`Enviando folhas de sprites… ${done}/${opened.files.length - missing.length}`);
@@ -218,7 +433,8 @@ async function openCatalog(selectedFiles) {
   });
   await Promise.all(workers);
   let summary = opened.summary;
-  const appearances = summary.appearancesFile ? byName.get(summary.appearancesFile) : undefined;
+  const appearancesEntry = summary.appearancesFile ? byName.get(summary.appearancesFile) : undefined;
+  const appearances = appearancesEntry ? await entryFile(appearancesEntry) : undefined;
   if (appearances) {
     setMessage(`Lendo ${appearances.name} (${formatBytes(appearances.size)})…`);
     summary = (await api("/api/catalog/appearances", {
@@ -631,13 +847,11 @@ async function createProject() {
         signature: Number($("#signature").value),
       }),
     });
-    state.selected = null;
-    state.page = 0;
-    thumbCache.clear();
-    state.sprites.rendered = false;
-    state.sprites.selected.clear();
-    state.sprites.page = 0;
-    applySummary(result.summary);
+    stopWatching();
+    folderState.project = null;
+    rememberFolder();
+    startProject(result.summary);
+    updateCompileTarget();
     setMessage("Projeto vazio criado. Adicione registros e sprites antes de compilar.", "success");
   } catch (error) {
     setMessage(error.message, "error");
@@ -646,18 +860,66 @@ async function createProject() {
   }
 }
 
+function recordExists(category, id, counts) {
+  const first = category === "items" ? 100 : 1;
+  return id >= first && id < first + counts[category];
+}
+
+/**
+ * Installs a freshly opened project. A new project starts from the first page with nothing selected; a reload of
+ * the same folder (`preserve`) keeps the category, search, pages, selections, viewed sprite and open record,
+ * dropping only what no longer exists. Sprite pixels may have changed, so cached thumbnails are discarded.
+ */
+function startProject(summary, { preserve = false } = {}) {
+  const viewedSprite = Number($("#spriteId").value);
+  thumbCache.clear();
+  state.sprites.rendered = false;
+  state.savedRevision = summary.revision;
+  if (preserve) {
+    for (const id of state.sprites.selected) if (id > summary.sprites.spriteCount) state.sprites.selected.delete(id);
+    const sel = state.recordSel;
+    if (sel.category) for (const id of sel.ids) if (!recordExists(sel.category, id, summary.counts)) sel.ids.delete(id);
+    updateRecordSelectionCount();
+    state.page = FS.clampPage(state.page, summary.counts[currentCategory()], state.pageSize);
+    if (state.selected && !recordExists(state.selected.category, state.selected.id, summary.counts)) closeRecordModal();
+  } else {
+    state.page = 0;
+    state.sprites.page = 0;
+    state.sprites.selected.clear();
+    clearRecordSelection();
+    closeRecordModal();
+  }
+  const size = summary.sprites.spriteSize;
+  const canvas = $("#spriteCanvas");
+  if (canvas.width !== size || canvas.height !== size || !preserve) {
+    canvas.width = size;
+    canvas.height = size;
+  }
+  applySummary(summary);
+  if (preserve && viewedSprite >= 1 && viewedSprite <= summary.sprites.spriteCount) {
+    loadSprite(viewedSprite).catch(() => {});
+  } else {
+    renderSprite(new Uint8Array(size * size * 4));
+  }
+}
+
+/** Reflects a summary returned by any project route. It never changes pages, selections or the viewed sprite. */
 function applySummary(summary) {
   const previousCount = state.summary?.sprites.spriteCount;
   state.summary = summary;
   state.spriteInfo = summary.sprites;
   $("#workspace").classList.remove("hidden");
   $("#compilePanel").classList.remove("hidden");
-  $("#projectStatus").textContent = `${summary.sprites.spriteCount} sprites · ${summary.dirty ? "alterações pendentes" : "carregado"}`;
-  $("#spriteCanvas").width = summary.sprites.spriteSize;
-  $("#spriteCanvas").height = summary.sprites.spriteSize;
-  renderSprite(new Uint8Array(summary.sprites.spriteSize * summary.sprites.spriteSize * 4));
+  updateProjectStatus();
   refreshRecords();
   if (previousCount !== summary.sprites.spriteCount || !state.sprites.rendered) renderSpriteGrid();
+}
+
+function updateProjectStatus() {
+  if (!state.summary) return;
+  const unsaved = hasUnsavedChanges();
+  const where = folderState.project ? "salvo na pasta" : "sem alterações";
+  $("#projectStatus").textContent = `${state.summary.sprites.spriteCount} sprites · ${unsaved ? "alterações não gravadas" : where}`;
 }
 
 let refreshToken = 0;
@@ -677,11 +939,19 @@ async function refreshRecords() {
     if (token !== refreshToken) return;
     state.records = result.records;
     renderRecordList(result);
+    if (state.pendingOpenRecord) {
+      const wanted = state.pendingOpenRecord;
+      state.pendingOpenRecord = null;
+      const record = state.records.find((item) => item.id === wanted.id && item.category === wanted.category);
+      if (record) openRecord(record);
+    }
     if (state.selected) {
       const selected = state.records.find((record) => record.id === state.selected.id && record.category === state.selected.category);
       if (selected) {
         state.selected = selected;
         if ($("#recordModal").open) renderRecord(selected);
+      } else if ($("#recordModal").open) {
+        closeRecordModal();
       }
     }
   } catch (error) {
@@ -703,7 +973,7 @@ function markSpriteFetchUnavailable(error) {
   spriteFetchBackoffUntil = Math.max(spriteFetchBackoffUntil, now + SPRITE_FETCH_BACKOFF_MS);
   if (now - spriteFetchLastNotice > SPRITE_FETCH_BACKOFF_MS) {
     spriteFetchLastNotice = now;
-    setMessage(/No asset project is open/i.test(message) ? "O servidor foi reiniciado e perdeu o projeto. Recarregue a página e abra a pasta novamente." : "Servidor indisponível no momento. Tentando reconectar…", "error");
+    setMessage(/No asset project is open/i.test(message) ? "O servidor foi reiniciado e perdeu o projeto. Recarregue a página e abra a pasta novamente." : "Servidor indisponível no momento. Tentando reconectar…", "error", { popup: false });
   }
   const unavailable = new Error("Servidor indisponível no momento. Tentando reconectar…");
   unavailable.name = "ServerUnavailableError";
@@ -810,6 +1080,11 @@ setInterval(() => {
   }
 }, 250);
 
+function closeRecordModal() {
+  state.selected = null;
+  if ($("#recordModal").open) $("#recordModal").close();
+}
+
 function openRecord(record) {
   state.selected = record;
   renderRecord(record);
@@ -821,6 +1096,9 @@ function openRecord(record) {
 
 function renderRecordList(result) {
   const list = $("#recordList");
+  const pageKey = `${currentCategory()}:${state.page}:${$("#searchId").value.trim()}`;
+  const scrollTop = list.dataset.pageKey === pageKey ? list.scrollTop : 0;
+  list.dataset.pageKey = pageKey;
   list.replaceChildren();
   thumbObserver?.disconnect();
   visibleTiles.clear();
@@ -862,6 +1140,7 @@ function renderRecordList(result) {
     list.append(button);
     thumbObserver.observe(button);
   }
+  list.scrollTop = scrollTop;
   const totalPages = Math.max(1, Math.ceil(result.total / state.pageSize));
   $("#pageLabel").textContent = result.total ? `/ ${totalPages}` : "vazio";
   const pageInput = $("#pageInput");
@@ -921,7 +1200,7 @@ function selectAllRecords() {
 }
 
 document.addEventListener("keydown", (event) => {
-  if (event.target instanceof Element && event.target.closest("input, textarea, select, dialog")) return;
+  if (event.target instanceof Element && event.target.closest("input, textarea, select, dialog, .swal2-container")) return;
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a" && state.summary && $("#recordList")?.matches(":hover, :focus-within")) {
     event.preventDefault();
     selectAllRecords();
@@ -1100,18 +1379,69 @@ async function addRecord() {
   }
 }
 
-async function removeRecord() {
-  if (!state.selected || !confirm(`Excluir o registro ${state.selected.id}? Esta alteração só é aplicada aos arquivos compilados.`)) return;
-  try {
-    const query = new URLSearchParams({ category: state.selected.category, id: String(state.selected.id) });
-    const result = await api(`/api/project/record?${query}`, { method: "DELETE" });
-    state.selected = null;
-    $("#recordModal").close();
-    applySummary(result.summary);
-    setMessage("Registro removido do modelo.", "success");
-  } catch (error) {
-    setMessage(error.message, "error");
+const CATEGORY_LABELS = { items: "itens", outfits: "outfits", effects: "efeitos", missiles: "projéteis" };
+
+/**
+ * Deletes records after an explicit SweetAlert2 confirmation. One ID uses the single-record route (as the
+ * record dialog always did); several use the batch route, which removes them from the highest ID down so the
+ * positional IDs of the remaining selected records never shift onto unselected ones mid-operation.
+ */
+async function deleteRecords(category, ids) {
+  const sorted = [...new Set(ids)].sort((a, b) => a - b);
+  if (!sorted.length) return;
+  const many = sorted.length > 1;
+  const confirmed = await Dialogs.confirm({
+    title: many ? `Excluir ${sorted.length} registros?` : `Excluir o registro ${sorted[0]}?`,
+    html: `<p>${many
+      ? `Serão excluídos <strong>${sorted.length}</strong> registros de ${CATEGORY_LABELS[category]}:`
+      : `Será excluído o registro de ${CATEGORY_LABELS[category]}:`}</p>${Dialogs.list(sorted.map((id) => `${category} ${id}`))}`
+      + "<p>Os registros seguintes passam a ter IDs menores. A exclusão vale para o modelo em memória e só chega aos arquivos quando você compilar.</p>",
+    confirmText: many ? `Excluir ${sorted.length} registros` : "Excluir registro",
+    danger: true,
+  });
+  if (!confirmed) {
+    setMessage("Exclusão cancelada; nenhum registro foi removido.");
+    return;
   }
+  let result;
+  try {
+    if (many) {
+      result = await api("/api/project/records/delete", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ category, ids: sorted }),
+      });
+    } else {
+      const query = new URLSearchParams({ category, id: String(sorted[0]) });
+      result = { removed: sorted, failed: [], ...(await api(`/api/project/record?${query}`, { method: "DELETE" })) };
+    }
+  } catch (error) {
+    await Dialogs.error("Não foi possível excluir", { text: `${error.message}. Nenhum registro foi removido.` });
+    refreshRecords();
+    return;
+  }
+  const lowestRemoved = result.removed[0];
+  if (state.selected?.category === category && lowestRemoved !== undefined && state.selected.id >= lowestRemoved) {
+    // The open record was deleted or now has a different ID.
+    closeRecordModal();
+  }
+  if (state.recordSel.category === category) clearRecordSelection();
+  if (category === currentCategory()) state.page = FS.clampPage(state.page, result.summary.counts[category], state.pageSize);
+  applySummary(result.summary);
+  if (result.failed.length) {
+    setMessage(`${result.removed.length} de ${sorted.length} registro(s) excluído(s); ${result.failed.length} falharam.`, "", { popup: false });
+    await Dialogs.warning("Exclusão incompleta", {
+      html: `<p>${result.removed.length} de ${sorted.length} registro(s) foram excluídos. Não foi possível excluir:</p>`
+        + Dialogs.list(result.failed.map((failure) => `${category} ${failure.id}: ${failure.error}`)),
+    });
+  } else {
+    setMessage(many ? `${result.removed.length} registros excluídos do modelo.` : `Registro ${sorted[0]} excluído do modelo.`, "success");
+  }
+}
+
+function removeRecord() {
+  if (!state.selected) return;
+  return deleteRecords(state.selected.category, [state.selected.id]);
 }
 
 function renderSprite(rgba) {
@@ -1174,20 +1504,134 @@ async function replaceSprite(add = false) {
   }
 }
 
+function renderDownloads(result) {
+  const downloads = $("#downloads");
+  downloads.replaceChildren();
+  for (const file of result.files) {
+    const button = document.createElement("button");
+    button.textContent = `Baixar ${file.name} (${formatBytes(file.size)})`;
+    button.addEventListener("click", () => downloadFile(file.format, file.name, result.revision));
+    downloads.append(button);
+  }
+}
+
+async function ensureWritePermission(target) {
+  const options = { mode: "readwrite" };
+  const dirs = new Set([target.dat.dir, target.spr.dir, target.otfi?.dir].filter(Boolean));
+  for (const dir of dirs) {
+    if ((await dir.queryPermission(options)) !== "granted" && (await dir.requestPermission(options)) !== "granted") return false;
+  }
+  return true;
+}
+
+/**
+ * Streams one compiled file from the server into `writable`, checking the byte count. The writable belongs to
+ * FolderSync.commitAtomically, which commits or aborts it, so the pipe must neither close nor abort it.
+ */
+async function streamCompiledFile(format, revision, expectedSize, writable) {
+  const response = await api(`/api/project/download?format=${format}&revision=${revision}`);
+  let written = 0;
+  const counter = new TransformStream({
+    transform(chunk, controller) {
+      written += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+  });
+  await response.body.pipeThrough(counter).pipeTo(writable, { preventClose: true, preventAbort: true });
+  if (written !== expectedSize) throw new Error(`recebidos ${written} de ${expectedSize} bytes`);
+}
+
+/**
+ * Validate and compile, then replace the opened DAT/SPR/OTFI in the selected folder:
+ * 1. the server serializes, re-parses and validates the set (nothing on disk is touched if this fails);
+ * 2. the user confirms the replacement;
+ * 3. every file is streamed into a swap file and only when all three are complete are they committed,
+ *    so a failure leaves the folder as it was. Other files in the folder are never written.
+ * The folder watcher is paused during the write and then told about the new files, so the editor's own save
+ * is not mistaken for an external change.
+ */
 async function compileProject() {
   const button = $("#compileProject");
+  const target = folderState.project;
+  // Ask for write access first, while the click still counts as a user gesture.
+  const permission = target ? ensureWritePermission(target).catch(() => false) : null;
+  if (!target) {
+    const proceed = await Dialogs.confirm({
+      icon: "info",
+      title: "Nenhuma pasta de destino",
+      text: supportsFolderAccess
+        ? "Este projeto não foi aberto com “Escolher pasta…”, então não há onde gravar. Deseja validar, compilar e apenas baixar os arquivos?"
+        : "Este navegador não permite gravar em pastas locais. Deseja validar, compilar e baixar os arquivos?",
+      confirmText: "Compilar e baixar",
+    });
+    if (!proceed) return;
+  }
   try {
-    setBusy(button, true, "Validando DAT/SPR/OTFI…");
-    const result = await api("/api/project/compile", { method: "POST" });
-    const downloads = $("#downloads");
-    downloads.replaceChildren();
-    for (const file of result.files) {
-      const button = document.createElement("button");
-      button.textContent = `Baixar ${file.name} (${formatBytes(file.size)})`;
-      button.addEventListener("click", () => downloadFile(file.format, file.name));
-      downloads.append(button);
-    }
-    setMessage("Compilação validada. Baixe cada arquivo para criar o conjunto de saída.", "success");
+    await withProjectLock("compilação", async () => {
+      setBusy(button, true, "Validando DAT/SPR/OTFI…");
+      if (target && !(await permission)) {
+        throw new Error("O navegador não concedeu permissão de escrita na pasta. Nenhum arquivo foi alterado.");
+      }
+      let result;
+      try {
+        result = await api("/api/project/compile", { method: "POST" });
+      } catch (error) {
+        $("#downloads").replaceChildren();
+        await Dialogs.error("Falha na validação", {
+          text: `${error.message}. A compilação foi interrompida e nenhum arquivo da pasta foi alterado.`,
+        });
+        setMessage(`Falha na validação: ${error.message}`, "error", { popup: false });
+        return;
+      }
+      renderDownloads(result);
+      if (!target) {
+        setMessage("Compilação validada. Baixe cada arquivo para criar o conjunto de saída.", "success");
+        return;
+      }
+      const byFormat = new Map(result.files.map((file) => [file.format, file]));
+      const plan = [["dat", target.dat], ["spr", target.spr], ["otfi", target.otfi]]
+        .filter(([, entry]) => entry)
+        .map(([format, entry]) => ({ format, entry, size: byFormat.get(format).size }));
+      setBusy(button, true, "Aguardando confirmação…");
+      const confirmed = await Dialogs.confirm({
+        title: "Substituir arquivos na pasta?",
+        html: "<p>A validação e a compilação foram concluídas. Os arquivos abaixo serão substituídos:</p>"
+          + Dialogs.list(plan.map(({ entry, size }) => `${entry.path} (${formatBytes(size)})`))
+          + `<p>Os demais arquivos da pasta não são alterados.${target.otfi ? "" : " A pasta não tem OTFI, então nenhum OTFI será criado."}</p>`,
+        confirmText: "Substituir arquivos",
+        danger: true,
+      });
+      if (!confirmed) {
+        setMessage("Compilação validada; nenhum arquivo da pasta foi substituído. Os arquivos continuam disponíveis para download.");
+        return;
+      }
+      setBusy(button, true, "Gravando na pasta…");
+      const watcher = folderState.watcher;
+      const write = async () => {
+        try {
+          return await FS.commitAtomically(plan.map(({ format, entry, size }) => ({
+            name: entry.path,
+            open: () => entry.handle.createWritable({ keepExistingData: false }),
+            fill: (writable) => streamCompiledFile(format, result.revision, size, writable),
+          })));
+        } finally {
+          // Whatever reached the disk was written by the editor itself: never reload it as an external change.
+          if (watcher) watcher.acknowledge(await readFolderSnapshot().catch(() => watcher.baseline));
+        }
+      };
+      try {
+        const committed = watcher ? await watcher.pausedWhile(write) : await write();
+        state.savedRevision = result.revision;
+        updateProjectStatus();
+        setMessage(`Compilação validada e gravada: ${committed.join(", ")}.`, "", { popup: false });
+        await Dialogs.success("Compilação concluída", {
+          html: `<p>Validação e compilação concluídas. Arquivos substituídos na pasta:</p>${Dialogs.list(committed)}`,
+        });
+      } catch (error) {
+        setMessage(error.message, "error", { popup: false });
+        await Dialogs.error("Falha ao gravar na pasta", { text: error.message });
+      }
+    });
   } catch (error) {
     setMessage(error.message, "error");
   } finally {
@@ -1195,9 +1639,9 @@ async function compileProject() {
   }
 }
 
-async function downloadFile(format, name) {
+async function downloadFile(format, name, revision) {
   try {
-    const response = await api(`/api/project/download?format=${format}`);
+    const response = await api(`/api/project/download?format=${format}&revision=${revision}`);
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
@@ -1335,6 +1779,8 @@ function renderSpriteGrid() {
   const first = state.sprites.page * pageSize + 1;
   const last = Math.min(total, first + pageSize - 1);
   const grid = $("#spriteGrid");
+  const scrollTop = Number(grid.dataset.page) === state.sprites.page ? grid.scrollTop : 0;
+  grid.dataset.page = String(state.sprites.page);
   grid.replaceChildren();
   state.sprites.rendered = true;
   $("#spritePageLabel").textContent = total ? `/ ${pages} · ${first}–${last} de ${total}` : "sem sprites";
@@ -1371,6 +1817,7 @@ function renderSpriteGrid() {
     grid.append(tile);
     observer.observe(tile);
   }
+  grid.scrollTop = scrollTop;
 }
 
 function selectSprite(id, event) {
@@ -1387,7 +1834,7 @@ function selectSprite(id, event) {
     selected.add(id);
     state.sprites.anchor = id;
   }
-  document.querySelectorAll(".sprite-tile").forEach((tile) => {
+  document.querySelectorAll("#spriteGrid .sprite-tile").forEach((tile) => {
     tile.classList.toggle("selected", selected.has(Number(tile.dataset.id)));
   });
   updateSelectionCount();
@@ -1403,8 +1850,8 @@ $("#spriteGrid").addEventListener("click", (event) => {
 $("#spriteGrid").addEventListener("keydown", (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
     event.preventDefault();
-    document.querySelectorAll(".sprite-tile").forEach((tile) => state.sprites.selected.add(Number(tile.dataset.id)));
-    document.querySelectorAll(".sprite-tile").forEach((tile) => tile.classList.add("selected"));
+    document.querySelectorAll("#spriteGrid .sprite-tile").forEach((tile) => state.sprites.selected.add(Number(tile.dataset.id)));
+    document.querySelectorAll("#spriteGrid .sprite-tile").forEach((tile) => tile.classList.add("selected"));
     updateSelectionCount();
   }
 });
@@ -1444,8 +1891,13 @@ function menuItem(label, handler, disabled = false) {
   return button;
 }
 
+function dangerItem(button) {
+  button.classList.add("danger-item");
+  return button;
+}
+
 function spriteIdForTarget(target) {
-  const tile = target.closest(".sprite-tile");
+  const tile = target.closest("#spriteGrid .sprite-tile");
   if (tile) return { id: Number(tile.dataset.id), fromGrid: true };
   if (target.closest("#spriteCanvas")) return { id: Number($("#spriteId").value), fromGrid: false };
   const record = target.closest(".record-tile");
@@ -1492,6 +1944,10 @@ function showRecordMenu(event, tile) {
     title,
     menuItem(ids.length > 1 ? `Exportar ${ids.length} objetos (.obd em ZIP)` : "Exportar .obd", () => exportObd(category, ids)),
     menuItem("Limpar seleção", clearRecordSelection),
+    document.createElement("hr"),
+    dangerItem(ids.length > 1
+      ? menuItem(`Excluir selecionados (${ids.length})`, () => deleteRecords(category, ids))
+      : menuItem("Excluir registro", () => deleteRecords(category, ids))),
   );
   placeMenu(event);
 }
@@ -1534,6 +1990,13 @@ document.addEventListener("contextmenu", (event) => {
     menuItem("Colar como nova sprite", pasteSprite, state.clipboard === null),
     menuItem("Propriedades", () => showSpriteProperties(ids[0])),
   );
+  // Only sprites picked in the SPR grid can be deleted: a right-click on a record or a slot names a reference.
+  if (hit.fromGrid) {
+    menu.append(
+      document.createElement("hr"),
+      dangerItem(menuItem(many ? `Excluir selecionadas (${ids.length})` : "Excluir sprite", () => deleteSprites(ids))),
+    );
+  }
   (event.target.closest("dialog") ?? document.body).append(menu);
   menu.classList.remove("hidden");
   const margin = 8;
@@ -1663,6 +2126,7 @@ async function importObdFiles(files) {
   importState.abort = new AbortController();
   const { signal } = importState.abort;
   const problems = [];
+  const created = [];
   let imported = 0;
   let last = null;
   try {
@@ -1679,6 +2143,7 @@ async function importObdFiles(files) {
         });
         last = result;
         imported += 1;
+        created.push(`${result.category} ${result.id}`);
         result.warnings.forEach((warning) => problems.push(`${file.name}: ${warning}`));
       } catch (error) {
         if (signal.aborted) break;
@@ -1689,14 +2154,74 @@ async function importObdFiles(files) {
     importState.running = false;
     setImportPanel(`Concluído: ${imported}/${files.length} OBD importado(s).`, 100, false);
   }
-  if (last) {
-    $("#category").value = last.category;
-    state.page = 0;
-    applySummary(last.summary);
-    clearRecordSelection();
-  }
+  // Imported objects are appended as new records. The list only reflects the new counts: the category, page,
+  // selection and open record stay as the user left them (switching to the new record's category and jumping
+  // to page 0 here used to throw away the user's place in the list on every drop).
+  if (last) applySummary(last.summary);
+  const where = created.length ? ` Novo(s) registro(s): ${created.slice(0, 5).join(", ")}${created.length > 5 ? " …" : ""}.` : "";
   const detail = problems.length ? ` Avisos/erros: ${problems.slice(0, 3).join(" | ")}${problems.length > 3 ? " …" : ""}` : "";
-  setMessage(`${imported} OBD importado(s) como novo(s) registro(s).${detail}`, problems.length ? (imported ? "" : "error") : "success");
+  setMessage(`${imported} OBD importado(s).${where}${detail}`, problems.length ? (imported ? "" : "error") : "success");
+}
+
+/* Delete */
+
+/**
+ * Empties the given sprites after an explicit confirmation. SPR IDs are referenced by the DAT, so the IDs stay
+ * in place (each becomes a transparent sprite) and no other sprite is renumbered; the confirmation lists the
+ * objects that still reference them.
+ */
+async function deleteSprites(ids) {
+  const sorted = [...new Set(ids)].sort((a, b) => a - b);
+  if (!sorted.length) return;
+  const many = sorted.length > 1;
+  const post = (path) => api(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ids: sorted }),
+  });
+  const usage = await post("/api/project/sprites/usage");
+  const users = usage.records.map((record) => `${record.category} ${record.id}`);
+  const usageHtml = usage.total
+    ? `<p><strong>${usage.total}</strong> objeto(s) usam ${many ? "essas sprites" : "essa sprite"} e ficarão com partes transparentes:</p>${Dialogs.list(users, 8, usage.total)}`
+    : `<p>Nenhum objeto usa ${many ? "essas sprites" : "essa sprite"}.</p>`;
+  const confirmed = await Dialogs.confirm({
+    title: many ? `Excluir ${sorted.length} sprites?` : `Excluir a sprite ${sorted[0]}?`,
+    html: `<p>${many ? `Serão excluídas <strong>${sorted.length}</strong> sprites:` : "Será excluída a sprite:"}</p>`
+      + Dialogs.list(sorted.map((id) => `Sprite ${id}`))
+      + usageHtml
+      + "<p>Os IDs não mudam: cada sprite excluída vira uma sprite vazia, para não renumerar as referências do DAT. A exclusão só chega aos arquivos quando você compilar.</p>",
+    confirmText: many ? `Excluir ${sorted.length} sprites` : "Excluir sprite",
+    danger: true,
+  });
+  if (!confirmed) {
+    setMessage("Exclusão cancelada; nenhuma sprite foi removida.");
+    return;
+  }
+  let result;
+  try {
+    result = await post("/api/project/sprites/delete");
+  } catch (error) {
+    await Dialogs.error("Não foi possível excluir", { text: `${error.message}. Nenhuma sprite foi removida.` });
+    return;
+  }
+  for (const id of result.removed) {
+    thumbCache.delete(id);
+    state.sprites.selected.delete(id);
+  }
+  // applySummary re-renders the record list (and the open record), so thumbnails using these sprites refetch them.
+  applySummary(result.summary);
+  renderSpriteGrid();
+  const viewed = Number($("#spriteId").value);
+  if (result.removed.includes(viewed)) loadSprite(viewed).catch(() => {});
+  if (result.failed.length) {
+    setMessage(`${result.removed.length} de ${sorted.length} sprite(s) excluída(s); ${result.failed.length} falharam.`, "", { popup: false });
+    await Dialogs.warning("Exclusão incompleta", {
+      html: `<p>${result.removed.length} de ${sorted.length} sprite(s) foram excluídas. Não foi possível excluir:</p>`
+        + Dialogs.list(result.failed.map((failure) => `Sprite ${failure.id}: ${failure.error}`)),
+    });
+  } else {
+    setMessage(many ? `${result.removed.length} sprites excluídas do modelo.` : `Sprite ${sorted[0]} excluída do modelo.`, "success");
+  }
 }
 
 /* Copy / properties */
@@ -1887,11 +2412,12 @@ async function importFiles(fileList, { single = false } = {}) {
     imported ? `${imported} sprite(s) importada(s) (IDs ${firstId}–${lastId}).${failures ? ` ${failures} arquivo(s) falharam.` : ""}` : "Nenhuma sprite foi importada.",
     failures || !imported ? "error" : "success",
   );
+  // New sprites are appended after the last ID; the grid only re-renders its current page (the page label and
+  // the last page change with the new total). The page, the selection and the sprite in the preview are kept:
+  // jumping to the imported IDs here used to move the user's place in the sprite list on every drop.
   if (imported) {
-    state.sprites.page = Math.floor((lastId - 1) / state.sprites.pageSize);
     applySummary(state.summary);
     renderSpriteGrid();
-    await loadSprite(firstId).catch(() => {});
   }
 }
 
@@ -1943,3 +2469,216 @@ window.addEventListener("drop", (event) => {
   if (obd.length) importObdFiles(obd).then(() => (rest.length ? importFiles(rest) : undefined));
   else importFiles(rest);
 });
+
+/* ---------- Development live reload (only when the server runs with DEV_RELOAD=1) ----------
+   The server streams `hello` (its boot ID) and `change` (edited files under web/) over /api/dev/events.
+   - CSS changes swap the stylesheet in place.
+   - JS/HTML changes reload the page. The project stays in the server's memory, so the new page reattaches to
+     it and restores the category, search, pages, selections, viewed sprite and open record; the folder handles
+     come back from IndexedDB.
+   - A new boot ID means the server restarted (code under src/ changed) and lost the project: it is reopened
+     from the folder, keeping the view. Edits that were not saved to the folder are lost, and the user is told.
+   In production the route answers 404, the EventSource fails before any `hello` and is closed for good. */
+
+const VIEW_KEY = "oteditor:dev-view";
+const devReload = { bootId: null, timer: null };
+
+function idbRequest(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function folderStore(mode) {
+  const open = indexedDB.open("oteditor", 1);
+  open.onupgradeneeded = () => open.result.createObjectStore("folder");
+  const db = await idbRequest(open);
+  return { store: db.transaction("folder", mode).objectStore("folder"), db };
+}
+
+/** Keeps the open folder's handles (structured-cloneable) so a reloaded page can use them again. */
+async function rememberFolder() {
+  try {
+    const { store, db } = await folderStore("readwrite");
+    await idbRequest(folderState.project ? store.put({ root: folderState.root, project: folderState.project }, "project") : store.delete("project"));
+    db.close();
+  } catch {
+    // Without IndexedDB a development reload only loses the folder link, not the project.
+  }
+}
+
+async function recallFolder() {
+  try {
+    const { store, db } = await folderStore("readonly");
+    const value = await idbRequest(store.get("project"));
+    db.close();
+    return value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function saveViewForReload() {
+  const view = {
+    category: currentCategory(),
+    search: $("#searchId").value,
+    clientVersion: $("#clientVersion").value,
+    page: state.page,
+    spritePage: state.sprites.page,
+    spriteId: $("#spriteId").value,
+    sprites: [...state.sprites.selected],
+    records: state.recordSel.category ? { category: state.recordSel.category, ids: [...state.recordSel.ids] } : null,
+    openRecord: $("#recordModal").open && state.selected ? { category: state.selected.category, id: state.selected.id } : null,
+    savedRevision: state.savedRevision,
+    scroll: window.scrollY,
+  };
+  try {
+    sessionStorage.setItem(VIEW_KEY, JSON.stringify(view));
+  } catch {
+    // Private mode: the page still reloads, just without the saved view.
+  }
+}
+
+function takeSavedView() {
+  try {
+    const raw = sessionStorage.getItem(VIEW_KEY);
+    sessionStorage.removeItem(VIEW_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function applySavedView(view) {
+  $("#category").value = view.category;
+  $("#searchId").value = view.search;
+  $("#clientVersion").value = view.clientVersion;
+  $("#spriteId").value = view.spriteId;
+  state.page = view.page;
+  state.sprites.page = view.spritePage;
+  state.sprites.selected = new Set(view.sprites);
+  if (view.records) state.recordSel = { category: view.records.category, ids: new Set(view.records.ids), anchor: null };
+  state.pendingOpenRecord = view.openRecord;
+}
+
+/** Re-links the remembered folder; watching needs permission, which a reloaded page may have to ask again. */
+async function relinkFolder(remembered) {
+  folderState.root = remembered.root;
+  folderState.project = remembered.project;
+  folderState.entries = [];
+  $("#pickedFolder").textContent = remembered.root?.name ?? remembered.project.dat.path.split("/")[0];
+  updateCompileTarget();
+  if ((await remembered.project.dat.dir.queryPermission({ mode: "readwrite" })) === "granted") {
+    await startWatching();
+    return;
+  }
+  setWatchStatus("● pasta desconectada — clique para reconectar", "watch-error");
+  const chip = $("#watchStatus");
+  chip.classList.add("clickable");
+  chip.addEventListener("click", async function reconnect() {
+    if (!(await ensureWritePermission(remembered.project))) return;
+    chip.removeEventListener("click", reconnect);
+    chip.classList.remove("clickable");
+    await startWatching();
+  });
+}
+
+/** After a development page reload: reattach to the project still open on the server and restore the view. */
+async function restoreAfterDevReload() {
+  const view = takeSavedView();
+  if (!view) return;
+  const remembered = await recallFolder();
+  try {
+    applySavedView(view);
+    let summary;
+    try {
+      summary = (await api("/api/project/summary")).summary;
+    } catch {
+      // The server restarted together with the page: reopen the project from the folder, if it can be read.
+      if (!remembered || (await remembered.project.dat.dir.queryPermission({ mode: "read" })) !== "granted") {
+        setMessage("O servidor reiniciou e perdeu o projeto. Abra a pasta novamente.", "error");
+        return;
+      }
+      folderState.project = remembered.project;
+      remembered.project = FS.findProjectFiles(await listProjectDirectories());
+      summary = (await uploadAndOpen(remembered.project)).summary;
+      view.savedRevision = summary.revision;
+    }
+    startProject(summary, { preserve: true });
+    state.savedRevision = view.savedRevision;
+    updateProjectStatus();
+    if (remembered) await relinkFolder(remembered);
+    else updateCompileTarget();
+    requestAnimationFrame(() => window.scrollTo(0, view.scroll));
+    setMessage("Editor atualizado (recarga de desenvolvimento).", "", { popup: false });
+  } catch (error) {
+    setMessage(`Não foi possível restaurar o projeto após a recarga: ${error.message}`, "error");
+  }
+}
+
+function swapStylesheet() {
+  const current = document.querySelector('link[rel="stylesheet"][href^="/app.css"]');
+  if (!current) return;
+  const next = current.cloneNode();
+  next.href = `/app.css?v=${Date.now()}`;
+  next.addEventListener("load", () => current.remove(), { once: true });
+  current.after(next);
+}
+
+function applyDevChange(files) {
+  if (files.every((file) => file.endsWith(".css"))) {
+    swapStylesheet();
+    return;
+  }
+  // Coalesce bursts; never reload in the middle of a save, a reload or an import.
+  clearTimeout(devReload.timer);
+  devReload.timer = setTimeout(function reloadWhenIdle() {
+    if (projectLock.name || importState.running) {
+      devReload.timer = setTimeout(reloadWhenIdle, 500);
+      return;
+    }
+    if (state.summary) saveViewForReload();
+    location.reload();
+  }, 150);
+}
+
+async function handleServerRestart() {
+  if (!state.summary) return;
+  const lostEdits = hasUnsavedChanges();
+  if (!folderState.project) {
+    setMessage("O servidor reiniciou e perdeu o projeto. Abra a pasta novamente.", "error");
+    return;
+  }
+  try {
+    // Pick the files again: the folder may have changed while the server was down.
+    const picked = FS.findProjectFiles(await listProjectDirectories());
+    await withProjectLock("recarga do projeto", () => reloadProject(picked));
+    if (lostEdits) {
+      Dialogs.warning("Servidor reiniciado", {
+        text: "O servidor foi reiniciado e o projeto foi reaberto da pasta. As alterações que ainda não tinham sido gravadas na pasta foram perdidas.",
+      });
+    } else {
+      Dialogs.toast("Servidor reiniciado; projeto reaberto da pasta.", "info");
+    }
+  } catch (error) {
+    setMessage(`O servidor reiniciou e não foi possível reabrir o projeto: ${error.message}`, "error");
+  }
+}
+
+function connectDevReload() {
+  const source = new EventSource("/api/dev/events");
+  source.addEventListener("hello", (event) => {
+    const { bootId } = JSON.parse(event.data);
+    const restarted = devReload.bootId !== null && devReload.bootId !== bootId;
+    devReload.bootId = bootId;
+    if (restarted) handleServerRestart();
+  });
+  source.addEventListener("change", (event) => applyDevChange(JSON.parse(event.data).files));
+  source.addEventListener("error", () => {
+    // No `hello` yet: the route does not exist (production server). Stop instead of retrying forever.
+    if (devReload.bootId === null) source.close();
+  });
+}
+
+restoreAfterDevReload().finally(connectDevReload);

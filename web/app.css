@@ -150,3 +150,24 @@ dialog.props-dialog { width: min(520px, 94vw); }
 .catalog-preview h3 { margin: 0; font-size: .95rem; }
 .catalog-preview select { max-width: 50%; }
 .catalog-preview .props-list { max-height: 220px; overflow: auto; }
+
+.topbar-status { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.status-pill.watching { color: var(--accent); border-color: #2b5a58; }
+.status-pill.watch-error { color: #ffaaa4; border-color: #753c47; }
+.field-label { color: var(--muted); font-size: .83rem; font-weight: 600; }
+
+/* SweetAlert2, matched to the editor palette (buttons reuse the editor's own button styles) */
+.swal2-popup.ot-swal { border: 1px solid var(--line); border-radius: 14px; color: #e8edf7; background: var(--panel); box-shadow: 0 16px 38px #03081699; font-family: inherit; }
+.swal2-popup.ot-swal .swal2-title { color: #e8edf7; font-size: 1.15rem; letter-spacing: -.02em; }
+.swal2-popup.ot-swal .swal2-html-container { color: var(--muted); font-size: .88rem; line-height: 1.5; text-align: left; }
+.swal2-container:has(.ot-swal:not(.ot-swal-toast)) { background: #020611cc; }
+.ot-swal-actions { gap: 8px; }
+.ot-swal-actions button { margin: 0; }
+.ot-swal-list { max-height: 180px; overflow: auto; margin: 8px 0 0; padding-left: 20px; color: #e8edf7; font-size: .8rem; }
+.ot-swal-list .ot-swal-more { color: var(--muted); list-style: none; margin-left: -20px; }
+.swal2-popup.ot-swal-toast { padding: 10px 14px; }
+.swal2-popup.ot-swal-toast .swal2-title { font-size: .85rem; font-weight: 600; margin: 0 6px; }
+.swal2-popup.ot-swal .swal2-timer-progress-bar { background: var(--accent); }
+.context-menu button.danger-item { color: #ffaaa4; }
+.swal2-popup.ot-swal .swal2-html-container p { margin: 8px 0 0; }
+.status-pill.clickable { cursor: pointer; }

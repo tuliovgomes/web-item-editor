@@ -8,8 +8,13 @@ import type { Appearance, AppearanceCategory } from "./formats/appearances.js";
 import { SpriteCatalog } from "./formats/catalog.js";
 import type { DatCategory } from "./formats/dat.js";
 import type { CompiledProjectFile } from "./project/project.js";
+import { createDevReload } from "./dev-reload.js";
 
 const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024 - 1;
+// Staged uploads are kept per upload session (one per "open" in a browser tab), so two tabs opening at the same
+// time — e.g. both reopening after a server restart — never mix each other's DAT and SPR. Abandoned sessions are
+// evicted, oldest first, because a staged SPR can be gigabytes.
+const MAX_UPLOAD_SESSIONS = 4;
 const CATEGORIES = new Set<DatCategory>(["items", "outfits", "effects", "missiles"]);
 type UploadKind = "dat" | "spr" | "otfi";
 type DownloadFormat = "dat" | "spr" | "otfi";
@@ -24,6 +29,7 @@ interface CompiledFiles {
   readonly dat: CompiledProjectFile;
   readonly spr: CompiledProjectFile;
   readonly otfi: CompiledProjectFile;
+  readonly revision: number;
 }
 
 function sendJson(response: ServerResponse, status: number, value: unknown): void {
@@ -137,8 +143,20 @@ function mimeFor(file: string): string {
   return "application/octet-stream";
 }
 
+/** Public paths served from disk: the editor's own files plus the vendored SweetAlert2 build. */
+const STATIC_FILES = new Map<string, string>([
+  ["/", "web/index.html"],
+  ["/app.css", "web/app.css"],
+  ["/app.js", "web/app.js"],
+  ["/sprite-io.js", "web/sprite-io.js"],
+  ["/folder-sync.js", "web/folder-sync.js"],
+  ["/dialogs.js", "web/dialogs.js"],
+  ["/vendor/sweetalert2.min.js", "node_modules/sweetalert2/dist/sweetalert2.min.js"],
+  ["/vendor/sweetalert2.min.css", "node_modules/sweetalert2/dist/sweetalert2.min.css"],
+]);
+
 async function serveStatic(response: ServerResponse, file: string): Promise<void> {
-  const path = resolve(process.cwd(), "web", file);
+  const path = resolve(process.cwd(), file);
   const content = await readFile(path);
   response.writeHead(200, {
     "content-type": mimeFor(file),
@@ -206,30 +224,38 @@ export interface EditorServer {
 
 export function createEditorServer(): EditorServer {
   let project: AssetProject | undefined;
-  let uploads: StagedUploads = {};
+  const uploadSessions = new Map<string, StagedUploads>();
+  const uploadSession = (url: URL): string => {
+    const session = url.searchParams.get("session") ?? "";
+    if (!/^[\w-]{0,64}$/.test(session)) throw new Error("Invalid upload session");
+    return session;
+  };
   let compiled: CompiledFiles | undefined;
   let catalog: SpriteCatalog | undefined;
+  // Bumped by every edit of the open project, so the browser can tell whether the files on disk are current.
+  let revision = 0;
+
+  const markChanged = (): void => {
+    compiled = undefined;
+    revision += 1;
+  };
+  const projectSummary = () => ({ ...project!.summary, revision });
 
   const obdPool = new ObdWorkerPool();
+  const devReload = process.env["DEV_RELOAD"] === "1" ? createDevReload(resolve(process.cwd(), "web")) : undefined;
   const server = createServer((request, response) => {
     void (async () => {
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
       const method = request.method ?? "GET";
 
-      if (method === "GET" && url.pathname === "/") {
-        await serveStatic(response, "index.html");
+      const staticFile = method === "GET" ? STATIC_FILES.get(url.pathname) : undefined;
+      if (staticFile !== undefined) {
+        await serveStatic(response, staticFile);
         return;
       }
-      if (method === "GET" && url.pathname === "/app.css") {
-        await serveStatic(response, "app.css");
-        return;
-      }
-      if (method === "GET" && url.pathname === "/app.js") {
-        await serveStatic(response, "app.js");
-        return;
-      }
-      if (method === "GET" && url.pathname === "/sprite-io.js") {
-        await serveStatic(response, "sprite-io.js");
+
+      if (method === "GET" && url.pathname === "/api/dev/events" && devReload !== undefined) {
+        devReload.connect(response);
         return;
       }
 
@@ -238,9 +264,14 @@ export function createEditorServer(): EditorServer {
         if (kind !== "dat" && kind !== "spr" && kind !== "otfi") {
           throw new Error("Upload kind must be dat, spr or otfi");
         }
-        uploads[kind as UploadKind] = await readBody(request, MAX_UPLOAD_BYTES);
-        compiled = undefined;
-        sendJson(response, 200, { kind, bytes: uploads[kind as UploadKind]!.length });
+        const session = uploadSession(url);
+        const data = await readBody(request, MAX_UPLOAD_BYTES);
+        const staged = uploadSessions.get(session) ?? {};
+        staged[kind as UploadKind] = data;
+        uploadSessions.delete(session);
+        uploadSessions.set(session, staged);
+        while (uploadSessions.size > MAX_UPLOAD_SESSIONS) uploadSessions.delete(uploadSessions.keys().next().value!);
+        sendJson(response, 200, { kind, bytes: data.length });
         return;
       }
 
@@ -337,18 +368,20 @@ export function createEditorServer(): EditorServer {
       }
 
       if (method === "POST" && url.pathname === "/api/project/open") {
+        const session = uploadSession(url);
+        const uploads = uploadSessions.get(session) ?? {};
         if (uploads.dat === undefined || uploads.spr === undefined) {
           throw new Error("Upload both DAT and SPR files before opening a project");
         }
         const clientVersion = numberParam(url, "clientVersion");
+        uploadSessions.delete(session);
         project = AssetProject.open({
           dat: uploads.dat,
           spr: uploads.spr,
           ...(uploads.otfi === undefined ? {} : { otfi: uploads.otfi }),
         }, { clientVersion });
-        uploads = {};
         compiled = undefined;
-        sendJson(response, 200, { summary: project.summary });
+        sendJson(response, 200, { summary: projectSummary() });
         return;
       }
 
@@ -359,13 +392,13 @@ export function createEditorServer(): EditorServer {
           { clientVersion: jsonNumber(body.clientVersion, "clientVersion") },
         );
         compiled = undefined;
-        sendJson(response, 201, { summary: project.summary });
+        sendJson(response, 201, { summary: projectSummary() });
         return;
       }
 
       if (method === "GET" && url.pathname === "/api/project/summary") {
         if (project === undefined) throw new Error("No asset project is open");
-        sendJson(response, 200, { summary: project.summary });
+        sendJson(response, 200, { summary: projectSummary() });
         return;
       }
 
@@ -403,8 +436,8 @@ export function createEditorServer(): EditorServer {
           throw new Error("value must be a boolean, number or string");
         }
         project.setProperty(category, id, body.name, body.value);
-        compiled = undefined;
-        sendJson(response, 200, { summary: project.summary });
+        markChanged();
+        sendJson(response, 200, { summary: projectSummary() });
         return;
       }
 
@@ -425,8 +458,8 @@ export function createEditorServer(): EditorServer {
           jsonNumber(body.slot, "slot"),
           jsonNumber(body.spriteId, "spriteId"),
         );
-        compiled = undefined;
-        sendJson(response, 200, { summary: project.summary });
+        markChanged();
+        sendJson(response, 200, { summary: projectSummary() });
         return;
       }
 
@@ -436,8 +469,8 @@ export function createEditorServer(): EditorServer {
         const category = categoryFrom(typeof body.category === "string" ? body.category : null);
         const sourceId = body.sourceId === undefined ? undefined : jsonNumber(body.sourceId, "sourceId");
         const id = project.createRecord(category, sourceId);
-        compiled = undefined;
-        sendJson(response, 201, { id, summary: project.summary });
+        markChanged();
+        sendJson(response, 201, { id, summary: projectSummary() });
         return;
       }
 
@@ -446,8 +479,22 @@ export function createEditorServer(): EditorServer {
         const category = categoryFrom(url.searchParams.get("category"));
         const id = numberParam(url, "id");
         project.removeRecord(category, id);
-        compiled = undefined;
-        sendJson(response, 200, { summary: project.summary });
+        markChanged();
+        sendJson(response, 200, { summary: projectSummary() });
+        return;
+      }
+
+      if (method === "POST" && url.pathname === "/api/project/records/delete") {
+        if (project === undefined) throw new Error("No asset project is open");
+        const body = await readJson<{ category: unknown; ids: unknown }>(request, 1024 * 1024);
+        const category = categoryFrom(typeof body.category === "string" ? body.category : null);
+        if (!Array.isArray(body.ids) || body.ids.length === 0 || body.ids.length > 65_536) {
+          throw new Error("ids must list between 1 and 65536 record IDs");
+        }
+        const ids = body.ids.map((value, index) => jsonNumber(value, `ids[${index}]`));
+        const result = project.removeRecords(category, ids);
+        if (result.removed.length > 0) markChanged();
+        sendJson(response, 200, { ...result, summary: projectSummary() });
         return;
       }
 
@@ -470,8 +517,8 @@ export function createEditorServer(): EditorServer {
         if (project === undefined) throw new Error("No asset project is open");
         const spriteId = numberParam(url, "id");
         project.replaceSprite(spriteId, await readBody(request, 256 * 256 * 4));
-        compiled = undefined;
-        sendJson(response, 200, { summary: project.summary });
+        markChanged();
+        sendJson(response, 200, { summary: projectSummary() });
         return;
       }
 
@@ -515,16 +562,34 @@ export function createEditorServer(): EditorServer {
         for (let index = 1; index < count; index += 1) {
           project.addSprite(body.subarray(index * frameBytes, (index + 1) * frameBytes));
         }
-        compiled = undefined;
-        sendJson(response, 201, { firstId, count, summary: project.summary });
+        markChanged();
+        sendJson(response, 201, { firstId, count, summary: projectSummary() });
+        return;
+      }
+
+      if (method === "POST" && (url.pathname === "/api/project/sprites/usage" || url.pathname === "/api/project/sprites/delete")) {
+        if (project === undefined) throw new Error("No asset project is open");
+        const body = await readJson<{ ids: unknown }>(request, 8 * 1024 * 1024);
+        if (!Array.isArray(body.ids) || body.ids.length === 0 || body.ids.length > 1_000_000) {
+          throw new Error("ids must list between 1 and 1000000 sprite IDs");
+        }
+        const ids = body.ids.map((value, index) => jsonNumber(value, `ids[${index}]`));
+        if (url.pathname.endsWith("/usage")) {
+          const users = project.spriteUsage(ids);
+          sendJson(response, 200, { total: users.length, records: users.slice(0, 50) });
+          return;
+        }
+        const result = project.removeSprites(ids);
+        if (result.removed.length > 0) markChanged();
+        sendJson(response, 200, { ...result, summary: projectSummary() });
         return;
       }
 
       if (method === "POST" && url.pathname === "/api/project/sprite/add") {
         if (project === undefined) throw new Error("No asset project is open");
         const spriteId = project.addSprite(await readBody(request, 256 * 256 * 4));
-        compiled = undefined;
-        sendJson(response, 201, { spriteId, summary: project.summary });
+        markChanged();
+        sendJson(response, 201, { spriteId, summary: projectSummary() });
         return;
       }
 
@@ -563,8 +628,8 @@ export function createEditorServer(): EditorServer {
       if (method === "POST" && url.pathname === "/api/project/obd") {
         if (project === undefined) throw new Error("No asset project is open");
         const result = project.importObd(await readBody(request, MAX_OBD_UPLOAD_BYTES));
-        compiled = undefined;
-        sendJson(response, 201, { ...result, summary: project.summary });
+        markChanged();
+        sendJson(response, 201, { ...result, summary: projectSummary() });
         return;
       }
 
@@ -572,12 +637,13 @@ export function createEditorServer(): EditorServer {
         if (project === undefined) throw new Error("No asset project is open");
         const files = project.compile();
         if (files.length !== 3) throw new Error("Compilation did not produce all DAT, SPR and OTFI files");
-        compiled = { dat: files[0]!, spr: files[1]!, otfi: files[2]! };
+        compiled = { dat: files[0]!, spr: files[1]!, otfi: files[2]!, revision };
         sendJson(response, 200, {
-          files: Object.entries(compiled).map(([format, file]) => ({
+          revision,
+          files: (["dat", "spr", "otfi"] as const).map((format) => ({
             format,
-            name: file.name,
-            size: file.data.length,
+            name: compiled![format].name,
+            size: compiled![format].data.length,
           })),
         });
         return;
@@ -588,6 +654,9 @@ export function createEditorServer(): EditorServer {
         const format = url.searchParams.get("format") as DownloadFormat | null;
         if (format !== "dat" && format !== "spr" && format !== "otfi") {
           throw new Error("Download format must be dat, spr or otfi");
+        }
+        if (url.searchParams.has("revision") && numberParam(url, "revision") !== compiled.revision) {
+          throw new Error("O projeto mudou depois da compilação; compile novamente");
         }
         const file = compiled[format];
         response.writeHead(200, {
@@ -639,6 +708,7 @@ export function createEditorServer(): EditorServer {
     close() {
       return new Promise((resolveClose, reject) => {
         void obdPool.close();
+        devReload?.close();
         server.close((error) => error ? reject(error) : resolveClose());
       });
     },

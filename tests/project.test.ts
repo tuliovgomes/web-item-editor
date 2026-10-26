@@ -86,3 +86,41 @@ test("falls back to another flag table when the OTFI-inferred version cannot par
   const reopened = AssetProject.open({ dat: byName(".dat"), spr: byName(".spr"), otfi }, { clientVersion: 0 });
   assert.ok(reopened.summary.clientVersion >= 700);
 });
+
+test("removes several records by their current IDs without touching unselected ones", () => {
+  const project = AssetProject.create(1, { clientVersion: 772 });
+  for (let index = 0; index < 6; index += 1) {
+    const id = project.createRecord("items");
+    project.setProperty("items", id, "groundSpeed", id);
+  }
+  // IDs 100..105 carry their own ID as groundSpeed; delete 101, 103 and 104 (passed out of order, with a repeat).
+  const result = project.removeRecords("items", [104, 101, 103, 101, 999]);
+  assert.deepEqual(result.removed, [101, 103, 104]);
+  assert.deepEqual(result.failed.map((failure) => failure.id), [999]);
+  assert.match(result.failed[0]!.error, /No items record with ID 999/);
+  assert.deepEqual(project.list("items").map((record) => record.properties.groundSpeed), [100, 102, 105]);
+});
+
+test("removes sprites in place, keeping every ID and reporting the records that use them", () => {
+  const project = AssetProject.create(1, { clientVersion: 772 });
+  // Opaque pixels: a 7.72 SPR stores RGB, so alpha always comes back as 255.
+  const pixels = (value: number) => Buffer.from(Buffer.alloc(32 * 32 * 4, value).map((byte, index) => (index % 4 === 3 ? 255 : byte)));
+  for (let index = 1; index <= 4; index += 1) project.addSprite(pixels(index));
+  const item = project.createRecord("items");
+  project.setSpriteId("items", item, 0, 0, 3);
+
+  assert.deepEqual(project.spriteUsage([2, 3]), [{ category: "items", id: item }]);
+  assert.deepEqual(project.spriteUsage([4]), []);
+  const result = project.removeSprites([3, 2, 9]);
+  assert.deepEqual(result.removed, [2, 3]);
+  assert.deepEqual(result.failed.map((failure) => failure.id), [9]);
+
+  const files = project.compile();
+  const reopened = AssetProject.open({ dat: files[0]!.data, spr: files[1]!.data, otfi: files[2]!.data }, { clientVersion: 772 });
+  assert.equal(reopened.summary.sprites.spriteCount, 4, "no sprite was renumbered");
+  assert.deepEqual(reopened.getSprite(1), pixels(1));
+  assert.ok(reopened.getSprite(2)!.every((byte) => byte === 0));
+  assert.ok(reopened.getSprite(3)!.every((byte) => byte === 0));
+  assert.deepEqual(reopened.getSprite(4), pixels(4));
+  assert.equal(reopened.list("items")[0]?.groups[0]?.spriteIds[0], 3, "DAT references are unchanged");
+});

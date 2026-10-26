@@ -10,6 +10,7 @@
     "dev": "sh ./scripts/dev.sh",
     "dev:cli": "tsx src/cli.ts",
     "dev:web": "tsx src/server.ts",
+    "dev:watch": "node scripts/dev-watch.cjs",
     "start": "node dist/src/server.js",
     "build": "tsc -p tsconfig.json",
     "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
@@ -24,6 +25,7 @@
     "typescript-eslint": "^8.0.0"
   },
   "dependencies": {
-    "lzma": "2.3.2"
+    "lzma": "2.3.2",
+    "sweetalert2": "11.26.25"
   }
 }

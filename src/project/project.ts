@@ -238,6 +238,57 @@ export class AssetProject {
     this.#dat.removeRecord(category, id);
   }
 
+  /**
+   * Removes several records by their current IDs. IDs are positional, so removal runs from the highest ID down:
+   * deleting a record shifts every later ID, never an earlier one, and each requested ID still names the record
+   * the caller saw. IDs that do not exist are reported instead of aborting the others.
+   */
+  removeRecords(category: DatCategory, ids: readonly number[]): { removed: number[]; failed: { id: number; error: string }[] } {
+    const removed: number[] = [];
+    const failed: { id: number; error: string }[] = [];
+    for (const id of [...new Set(ids)].sort((a, b) => b - a)) {
+      try {
+        this.#dat.removeRecord(category, id);
+        removed.push(id);
+      } catch (error) {
+        failed.push({ id, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    return { removed: removed.reverse(), failed: failed.reverse() };
+  }
+
+  /** Records whose frame groups reference any of `spriteIds` (each record listed once). */
+  spriteUsage(spriteIds: readonly number[]): { category: DatCategory; id: number }[] {
+    const wanted = new Set(spriteIds);
+    const users: { category: DatCategory; id: number }[] = [];
+    for (const category of ["items", "outfits", "effects", "missiles"] as const) {
+      for (const record of this.#dat.list(category, 0, this.#dat.getRecordCount(category))) {
+        if (record.groups.some((group) => group.spriteIds.some((spriteId) => wanted.has(spriteId)))) {
+          users.push({ category, id: record.id });
+        }
+      }
+    }
+    return users;
+  }
+
+  /**
+   * Empties several sprites. SPR IDs are referenced by the DAT, so removal keeps every ID in place (the slot
+   * becomes a transparent sprite) instead of renumbering the sprites after it. Missing IDs are reported.
+   */
+  removeSprites(spriteIds: readonly number[]): { removed: number[]; failed: { id: number; error: string }[] } {
+    const removed: number[] = [];
+    const failed: { id: number; error: string }[] = [];
+    for (const id of [...new Set(spriteIds)].sort((a, b) => a - b)) {
+      try {
+        this.#spr.removeSprite(id);
+        removed.push(id);
+      } catch (error) {
+        failed.push({ id, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    return { removed, failed };
+  }
+
   getSprite(spriteId: number): Buffer | undefined {
     return this.#spr.getSprite(spriteId);
   }
