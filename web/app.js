@@ -622,6 +622,8 @@ async function exportModernObd() {
   const started = performance.now();
   const results = new Array(ids.length);
   const problems = [];
+  const failures = [];
+  const validations = [];
   let finished = 0;
   let next = 0;
   const worker = async () => {
@@ -631,9 +633,11 @@ async function exportModernObd() {
       try {
         const response = await api(`/api/catalog/obd?${query}`);
         JSON.parse(decodeURIComponent(response.headers.get("x-obd-warnings") || "%5B%5D")).forEach((warning) => problems.push(warning));
+        const validation = decodeURIComponent(response.headers.get("x-obd-validation") || "");
+        if (validation) validations.push(`${category} ${ids[index]}: ${validation}`);
         results[index] = { name: `${category}_${ids[index]}.obd`, data: new Uint8Array(await response.arrayBuffer()) };
       } catch (error) {
-        problems.push(`falha ${category} ${ids[index]}: ${error.message}`);
+        failures.push(`${category} ${ids[index]}: ${error.message}`);
       }
       finished += 1;
       status.textContent = `Exportando OBD ${finished}/${ids.length}…`;
@@ -642,15 +646,17 @@ async function exportModernObd() {
   try {
     await Promise.all(Array.from({ length: Math.min(4, ids.length) }, worker));
     const entries = results.filter(Boolean);
-    if (!entries.length) throw new Error(problems[0] ?? "nenhum objeto exportado");
+    if (!entries.length) throw new Error(failures[0] ?? "nenhum objeto exportado");
     if (entries.length === 1) downloadBytes(entries[0].data, entries[0].name, "application/octet-stream");
     else downloadBytes(IO.buildZip(entries), `${category}_${ids[0]}-${ids.at(-1)}_obd.zip`, "application/zip");
     const seconds = ((performance.now() - started) / 1000).toFixed(1);
-    const notes = problems.length ? ` Avisos: ${problems.slice(0, 3).join(" | ")}${problems.length > 3 ? " …" : ""}` : "";
     const version = objectsState.clientVersion ? "" : " A versão do cliente não foi detectada pelo nome da pasta; o OBD foi gravado com versão 0.";
-    status.textContent = `${entries.length}/${ids.length} objeto(s) exportado(s) em .obd (${seconds} s).${version}${notes}`;
+    const message = `${entries.length}/${ids.length} objeto(s) exportado(s) em .obd (${seconds} s).${version}`;
+    status.textContent = `${message}${validations.length ? ` Animação conferida em ${validations.length} objeto(s).` : ""}`;
+    reportObdCheck({ title: "Exportação .obd", message, validations, warnings: problems, failures });
   } catch (error) {
     status.textContent = `Falha ao exportar OBD: ${error.message}`;
+    Dialogs.error("Falha ao exportar .obd", { text: error.message });
   } finally {
     objectsState.exporting = false;
     updateObjectsExport();
@@ -1629,15 +1635,12 @@ async function replaceRecordWithObd(category, id, file) {
   // The record keeps its ID but its content changed: restart its preview from the default group.
   if (recordPreview.key === `${category}:${id}`) recordPreview.key = null;
   applySummary(result.summary);
-  const summary = `${label} substituído por ${file.name}: ${result.groups} grupo(s) de frames, ${result.addedSprites} sprite(s) adicionada(s).`;
-  if (result.warnings.length) {
-    setMessage(summary, "", { popup: false });
-    await Dialogs.warning("Substituição concluída com avisos", {
-      html: `<p>${Dialogs.escapeHtml(summary)}</p>${Dialogs.list(result.warnings)}`,
-    });
-  } else {
-    setMessage(summary, "success");
-  }
+  reportObdCheck({
+    title: "Substituição",
+    message: `${label} substituído por ${file.name}: ${result.groups} grupo(s) de frames, ${result.addedSprites} sprite(s) adicionada(s).`,
+    validations: [result.validation],
+    warnings: result.warnings,
+  });
 }
 
 $("#replaceObdInput").addEventListener("change", (event) => {
@@ -2264,7 +2267,28 @@ async function fetchObd(category, id, signal) {
   const query = new URLSearchParams({ category, id: String(id) });
   const response = await api(`/api/project/obd?${query}`, { signal });
   const warnings = JSON.parse(decodeURIComponent(response.headers.get("x-obd-warnings") || "%5B%5D"));
-  return { data: new Uint8Array(await response.arrayBuffer()), warnings };
+  const validation = decodeURIComponent(response.headers.get("x-obd-validation") || "");
+  return { data: new Uint8Array(await response.arrayBuffer()), warnings, validation };
+}
+
+/**
+ * Final notice of an OBD export or import. Every exported/imported object was decoded again and compared with its
+ * source (groups, directions, frames, durations and pixels), and outfits had their movement checked; `validations`
+ * lists what was confirmed. Warnings or failures open a SweetAlert2 summary; a clean run is a toast.
+ */
+function reportObdCheck({ title, message, validations, warnings = [], failures = [] }) {
+  const checked = validations.length
+    ? ` Animação conferida${validations.length === 1 ? `: ${validations[0]}` : ` em ${validations.length} objeto(s)`}.`
+    : "";
+  const problems = warnings.length + failures.length;
+  setMessage(`${message}${checked}`, failures.length && !validations.length ? "error" : problems ? "" : "success", { popup: problems === 0 });
+  if (problems === 0) return;
+  Dialogs.warning(`${title} com avisos`, {
+    html: `<p>${Dialogs.escapeHtml(message)}</p>`
+      + (validations.length ? `<p>Animação conferida (grupos, direções, frames e pixels idênticos à origem):</p>${Dialogs.list(validations)}` : "")
+      + (failures.length ? `<p>Falhas:</p>${Dialogs.list(failures)}` : "")
+      + (warnings.length ? `<p>Avisos sobre a animação:</p>${Dialogs.list(warnings)}` : ""),
+  });
 }
 
 const OBD_EXPORT_CONCURRENCY = 4;
@@ -2281,6 +2305,7 @@ async function exportObd(category, ids) {
   const results = new Array(ids.length);
   const failures = [];
   const warnings = [];
+  const validations = [];
   let finished = 0;
   let bytes = 0;
   let next = 0;
@@ -2296,7 +2321,8 @@ async function exportObd(category, ids) {
         const result = await fetchObd(category, ids[index], signal);
         results[index] = { name: `${category}_${ids[index]}.obd`, data: result.data };
         bytes += result.data.length;
-        result.warnings.forEach((warning) => warnings.push(`${category} ${ids[index]}: ${warning}`));
+        warnings.push(...result.warnings);
+        if (result.validation) validations.push(`${category} ${ids[index]}: ${result.validation}`);
       } catch (error) {
         if (signal.aborted) return;
         failures.push(`${category} ${ids[index]}: ${error.message}`);
@@ -2318,10 +2344,14 @@ async function exportObd(category, ids) {
     if (entries.length === 0) throw new Error(failures[0] ?? "nenhum objeto exportado");
     if (entries.length === 1) downloadBytes(entries[0].data, entries[0].name, "application/octet-stream");
     else downloadBytes(IO.buildZip(entries), `${category}_${ids[0]}-${ids.at(-1)}_obd.zip`, "application/zip");
-    const notes = [...failures.map((failure) => `falha ${failure}`), ...warnings];
-    const suffix = notes.length ? ` Avisos: ${notes.slice(0, 3).join(" | ")}${notes.length > 3 ? " …" : ""}` : "";
     setImportPanel(`Concluído: ${entries.length}/${ids.length} OBD em ${seconds} s.`, 100, false);
-    setMessage(`${entries.length} objeto(s) exportado(s) em .obd (${seconds} s).${suffix}`, notes.length ? "" : "success");
+    reportObdCheck({
+      title: "Exportação .obd",
+      message: `${entries.length} objeto(s) exportado(s) em .obd (${seconds} s).`,
+      validations,
+      warnings,
+      failures,
+    });
   } catch (error) {
     setImportPanel(`Falha na exportação: ${error.message}`, 100, false);
     setMessage(`Falha ao exportar OBD: ${error.message}`, "error");
@@ -2340,7 +2370,9 @@ async function importObdFiles(files) {
   importState.abort = new AbortController();
   const { signal } = importState.abort;
   const problems = [];
+  const failures = [];
   const created = [];
+  const validations = [];
   let imported = 0;
   let last = null;
   try {
@@ -2358,10 +2390,11 @@ async function importObdFiles(files) {
         last = result;
         imported += 1;
         created.push(`${result.category} ${result.id}`);
+        validations.push(`${file.name} → ${result.category} ${result.id}: ${result.validation}`);
         result.warnings.forEach((warning) => problems.push(`${file.name}: ${warning}`));
       } catch (error) {
         if (signal.aborted) break;
-        problems.push(`${file.name}: ${error.message}`);
+        failures.push(`${file.name}: ${error.message}`);
       }
     }
   } finally {
@@ -2373,8 +2406,13 @@ async function importObdFiles(files) {
   // to page 0 here used to throw away the user's place in the list on every drop).
   if (last) applySummary(last.summary);
   const where = created.length ? ` Novo(s) registro(s): ${created.slice(0, 5).join(", ")}${created.length > 5 ? " …" : ""}.` : "";
-  const detail = problems.length ? ` Avisos/erros: ${problems.slice(0, 3).join(" | ")}${problems.length > 3 ? " …" : ""}` : "";
-  setMessage(`${imported} OBD importado(s).${where}${detail}`, problems.length ? (imported ? "" : "error") : "success");
+  reportObdCheck({
+    title: "Importação .obd",
+    message: `${imported} de ${files.length} OBD importado(s).${where}`,
+    validations,
+    warnings: problems,
+    failures,
+  });
 }
 
 /* Delete */
