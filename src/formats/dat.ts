@@ -1169,6 +1169,45 @@ export class DatDocument {
     this.#dirty = true;
   }
 
+  /** Removes every flag and property of a record (its sprite layout is kept). */
+  clearProperties(category: DatCategory, id: number): void {
+    const record = this.#recordAt(category, id);
+    record.properties = {};
+    record.flags = [];
+    record.flagBytes = encodeFlags({}, this.#options.clientVersion);
+    this.#dirty = true;
+  }
+
+  /** Deep copy of a record, to undo a multi-step change with `restoreRecord`. */
+  snapshotRecord(category: DatCategory, id: number): unknown {
+    const record = this.#recordAt(category, id);
+    const copy: MutableRecord = {
+      ...record,
+      flagBytes: Buffer.from(record.flagBytes),
+      groupData: Buffer.from(record.groupData),
+      flags: [...record.flags],
+      properties: { ...record.properties },
+      groups: record.groups.map((group) => ({
+        ...group,
+        spriteIds: [...group.spriteIds],
+        animationData: Buffer.from(group.animationData),
+        spriteOffsets: [...group.spriteOffsets],
+      })),
+    };
+    return copy;
+  }
+
+  restoreRecord(category: DatCategory, id: number, snapshot: unknown): void {
+    this.#recordAt(category, id);
+    this.#records[category][category === "items" ? id - 100 : id - 1] = snapshot as MutableRecord;
+  }
+
+  #recordAt(category: DatCategory, id: number): MutableRecord {
+    const record = this.#records[category][category === "items" ? id - 100 : id - 1];
+    if (record === undefined) throw new DatFormatError(`No ${category} record with ID ${id}`);
+    return record;
+  }
+
   createRecord(category: DatCategory, sourceId?: number): number {
     const records = this.#records[category];
     const categoryLimit = category === "items" ? 65_436 : 65_535;

@@ -57,12 +57,24 @@
     const dialog = topDialog();
     const keepDialogOpen = (event) => event.preventDefault();
     dialog?.addEventListener("cancel", keepDialogOpen);
+    // A toast on screen leaves `swal2-toast-shown` on <html>/<body>, and SweetAlert2's
+    // `body.swal2-toast-shown .swal2-container` rule then styles *every* container as a toast: 360px wide and
+    // `pointer-events: none`. A modal mounted inside a <dialog> is not cleaned up by the toast's own close, so it
+    // would let clicks fall through to the dialog underneath (e.g. toggling a property instead of "Cancelar").
+    if (Swal.isVisible() && Swal.getPopup()?.classList.contains("swal2-toast")) Swal.close();
+    clearToastState();
     return Swal.fire({
       ...BASE,
       ...options,
       target: dialog ?? document.body,
       customClass: { ...BASE.customClass, ...options.customClass },
+      didOpen: clearToastState,
     }).finally(() => dialog?.removeEventListener("cancel", keepDialogOpen));
+  }
+
+  function clearToastState() {
+    document.documentElement.classList.remove("swal2-toast-shown");
+    document.body.classList.remove("swal2-toast-shown");
   }
 
   function fireModal(options) {

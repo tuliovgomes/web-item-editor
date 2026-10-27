@@ -1578,6 +1578,77 @@ async function deleteRecords(category, ids) {
   }
 }
 
+/* Replace a record with an .obd file (keeps the ID; frame groups, frames, patterns and properties come from the file) */
+
+const replaceTarget = { category: null, id: null };
+const CATEGORY_SINGULAR = { items: "item", outfits: "outfit", effects: "efeito", missiles: "projétil" };
+
+function chooseReplacementObd(category, id) {
+  replaceTarget.category = category;
+  replaceTarget.id = id;
+  $("#replaceObdInput").value = "";
+  $("#replaceObdInput").click();
+}
+
+async function replaceRecordWithObd(category, id, file) {
+  const label = `${CATEGORY_SINGULAR[category]} ${id}`;
+  if (importState.running) {
+    setMessage("Já existe uma importação em andamento.", "error");
+    return;
+  }
+  if (file.size > 8 * 1024 * 1024) {
+    Dialogs.error("Arquivo grande demais", { text: `${file.name} excede o limite de 8 MiB de um .obd.` });
+    return;
+  }
+  const confirmed = await Dialogs.confirm({
+    title: `Substituir o ${label}?`,
+    html: `<p>O ${label} será substituído pelo conteúdo de <strong>${Dialogs.escapeHtml(file.name)}</strong>: grupos de frames (parado e andando), direções, addons, montarias, frames, durações e propriedades. O ID ${id} é mantido.</p>`
+      + "<p>As sprites do .obd são adicionadas ao SPR; as sprites antigas continuam nele, pois outros objetos podem usá-las. A alteração só chega à pasta quando você compilar.</p>",
+    confirmText: "Substituir",
+    danger: true,
+  });
+  if (!confirmed) {
+    setMessage("Substituição cancelada; o registro não foi alterado.");
+    return;
+  }
+  importState.running = true;
+  let result;
+  try {
+    const query = new URLSearchParams({ category, id: String(id) });
+    result = await api(`/api/project/obd/replace?${query}`, {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: await file.arrayBuffer(),
+    });
+  } catch (error) {
+    await Dialogs.error("Não foi possível substituir", { text: `${error.message}. O registro não foi alterado.` });
+    return;
+  } finally {
+    importState.running = false;
+  }
+  // The record keeps its ID but its content changed: restart its preview from the default group.
+  if (recordPreview.key === `${category}:${id}`) recordPreview.key = null;
+  applySummary(result.summary);
+  const summary = `${label} substituído por ${file.name}: ${result.groups} grupo(s) de frames, ${result.addedSprites} sprite(s) adicionada(s).`;
+  if (result.warnings.length) {
+    setMessage(summary, "", { popup: false });
+    await Dialogs.warning("Substituição concluída com avisos", {
+      html: `<p>${Dialogs.escapeHtml(summary)}</p>${Dialogs.list(result.warnings)}`,
+    });
+  } else {
+    setMessage(summary, "success");
+  }
+}
+
+$("#replaceObdInput").addEventListener("change", (event) => {
+  const [file] = event.target.files;
+  event.target.value = "";
+  if (file && replaceTarget.category) replaceRecordWithObd(replaceTarget.category, replaceTarget.id, file);
+});
+$("#replaceRecordObd").addEventListener("click", () => {
+  if (state.selected) chooseReplacementObd(state.selected.category, state.selected.id);
+});
+
 function removeRecord() {
   if (!state.selected) return;
   return deleteRecords(state.selected.category, [state.selected.id]);
@@ -2086,6 +2157,7 @@ function showRecordMenu(event, tile) {
     title,
     menuItem(ids.length > 1 ? `Exportar ${ids.length} objetos (.obd em ZIP)` : "Exportar .obd", () => exportObd(category, ids)),
     menuItem("Limpar seleção", clearRecordSelection),
+    ...(ids.length === 1 ? [menuItem("Substituir por .obd…", () => chooseReplacementObd(category, ids[0]))] : []),
     document.createElement("hr"),
     dangerItem(ids.length > 1
       ? menuItem(`Excluir selecionados (${ids.length})`, () => deleteRecords(category, ids))

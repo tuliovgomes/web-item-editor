@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { AssetProject } from "./project/project.js";
-import { buildModernObdPayload } from "./formats/obd.js";
+import { buildModernObdPayload, validateModernObdPayload } from "./formats/obd.js";
 import { AbortedError, ObdWorkerPool } from "./project/obd-pool.js";
 import type { Appearance, AppearanceCategory } from "./formats/appearances.js";
 import { SpriteCatalog } from "./formats/catalog.js";
@@ -331,7 +331,11 @@ export function createEditorServer(): EditorServer {
         const clientVersion = numberParam(url, "clientVersion", 0);
         if (clientVersion > 0xffff) throw new Error("clientVersion must fit in 16 bits");
         const source = catalog;
-        const payload = buildModernObdPayload({ appearance, clientVersion, getSprite: (spriteId) => source.getSprite(spriteId) });
+        const modernInput = { appearance, clientVersion, getSprite: (spriteId: number) => source.getSprite(spriteId) };
+        const payload = buildModernObdPayload(modernInput);
+        const check = validateModernObdPayload(modernInput, payload);
+        if (check.errors.length > 0) throw new Error(`Exportação de ${category} ${id} interrompida: ${check.errors.join(" ")}`);
+        payload.warnings.push(...check.warnings);
         const aborter = new AbortController();
         response.on("close", () => {
           if (!response.writableEnded) aborter.abort();
@@ -349,6 +353,7 @@ export function createEditorServer(): EditorServer {
           "cache-control": "no-store",
           "x-content-type-options": "nosniff",
           "x-obd-warnings": encodeURIComponent(JSON.stringify(payload.warnings)),
+          "x-obd-validation": encodeURIComponent(check.summary),
         });
         response.end(data);
         return;
@@ -630,8 +635,19 @@ export function createEditorServer(): EditorServer {
           "cache-control": "no-store",
           "x-content-type-options": "nosniff",
           "x-obd-warnings": encodeURIComponent(JSON.stringify(warnings)),
+          "x-obd-validation": encodeURIComponent(payload.validation ?? ""),
         });
         response.end(data);
+        return;
+      }
+
+      if (method === "POST" && url.pathname === "/api/project/obd/replace") {
+        if (project === undefined) throw new Error("No asset project is open");
+        const category = categoryFrom(url.searchParams.get("category"));
+        const id = numberParam(url, "id");
+        const result = project.replaceWithObd(category, id, await readBody(request, MAX_OBD_UPLOAD_BYTES));
+        markChanged();
+        sendJson(response, 200, { ...result, summary: projectSummary() });
         return;
       }
 

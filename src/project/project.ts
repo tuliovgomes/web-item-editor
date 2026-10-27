@@ -1,6 +1,10 @@
 import { Buffer } from "node:buffer";
 import { DatDocument, type DatCategory, type DatParseOptions, type DatRecordView } from "../formats/dat.js";
-import { buildObdPayload, compressObd, decodeObd, type ObdEncodeResult, type ObdPayload } from "../formats/obd.js";
+import {
+  buildObdPayload, compressObd, datAnimationGroups, decodeObd, validateObdPayload,
+  type ObdEncodeResult, type ObdPayload, type ObdThing,
+} from "../formats/obd.js";
+import { checkOutfitAnimation, compareAnimations, type AnimationGroup } from "../formats/animation-check.js";
 import { OtfiDocument, type OtfiSettings } from "../formats/otfi.js";
 import { SprDocument, type SprInfo, type SprOptions } from "../formats/spr.js";
 
@@ -13,6 +17,19 @@ export interface ProjectFiles {
 export interface ProjectOptions {
   readonly clientVersion: number;
 }
+
+export interface ObdApplyResult {
+  readonly category: DatCategory;
+  readonly id: number;
+  readonly addedSprites: number;
+  /** Frame groups written to the record (idle + walking outfits have 2). */
+  readonly groups: number;
+  /** What the import check confirmed, e.g. "2 grupos · 4 direções · andando 8 frames". */
+  readonly validation: string;
+  readonly warnings: string[];
+}
+
+const CATEGORY_NAMES: Readonly<Record<DatCategory, string>> = { items: "item", outfits: "outfit", effects: "efeito", missiles: "projétil" };
 
 export interface CompiledProjectFile {
   readonly name: string;
@@ -305,12 +322,17 @@ export class AssetProject {
   prepareObd(category: DatCategory, id: number): ObdPayload {
     const record = this.#dat.getRecord(category, id);
     if (record === undefined) throw new Error(`No ${category} record with ID ${id}`);
-    return buildObdPayload({
+    const input = {
       record,
       clientVersion: this.#clientVersion,
       spriteSize: this.#spr.info.spriteSize,
-      getSprite: (spriteId) => this.#spr.getSprite(spriteId),
-    });
+      getSprite: (spriteId: number) => this.#spr.getSprite(spriteId),
+    };
+    const payload = buildObdPayload(input);
+    // The file is decoded again and compared with the record before anyone gets it.
+    const check = validateObdPayload(input, payload);
+    if (check.errors.length > 0) throw new Error(`Exportação de ${category} ${id} interrompida: ${check.errors.join(" ")}`);
+    return { ...payload, warnings: [...payload.warnings, ...check.warnings], validation: check.summary };
   }
 
   exportObd(category: DatCategory, id: number): ObdEncodeResult {
@@ -319,13 +341,52 @@ export class AssetProject {
   }
 
   /** Appends the OBD object as a new record; existing records and sprites are never overwritten. */
-  importObd(file: Buffer): { category: DatCategory; id: number; addedSprites: number; warnings: string[] } {
+  importObd(file: Buffer): ObdApplyResult {
+    const thing = this.#decodeObd(file);
+    const sprites = this.#spr.info.spriteCount;
+    const id = this.#dat.createRecord(thing.category);
+    try {
+      return this.#applyObd(thing.category, id, thing);
+    } catch (error) {
+      this.#dat.removeRecord(thing.category, id);
+      this.#spr.truncate(sprites);
+      throw error;
+    }
+  }
+
+  /**
+   * Replaces an existing record (keeping its ID) with the OBD object: frame groups, frames, patterns, durations
+   * and properties. Its sprites are added as new SPR sprites; the record's old sprites stay in the SPR because
+   * other records may use them. On any error the record is left exactly as it was.
+   */
+  replaceWithObd(category: DatCategory, id: number, file: Buffer): ObdApplyResult {
+    const thing = this.#decodeObd(file);
+    if (thing.category !== category) {
+      throw new Error(`O .obd contém um ${CATEGORY_NAMES[thing.category]}, mas o registro é um ${CATEGORY_NAMES[category]}.`);
+    }
+    const snapshot = this.#dat.snapshotRecord(category, id);
+    const sprites = this.#spr.info.spriteCount;
+    try {
+      this.#dat.clearProperties(category, id);
+      return this.#applyObd(category, id, thing);
+    } catch (error) {
+      this.#dat.restoreRecord(category, id, snapshot);
+      this.#spr.truncate(sprites);
+      throw error;
+    }
+  }
+
+  #decodeObd(file: Buffer): ObdThing {
     const thing = decodeObd(file);
     if (this.#spr.info.spriteSize !== 32) {
       throw new Error(`OBD sprites are 32×32 but this project uses ${this.#spr.info.spriteSize}`);
     }
+    return thing;
+  }
+
+  /** Writes the OBD's frame groups, sprites and properties into an existing record. */
+  #applyObd(category: DatCategory, id: number, thing: ObdThing): ObdApplyResult {
     const warnings: string[] = [];
-    const category = thing.category;
     // Clients before 10.57 keep one group per outfit, and that group is the walking animation (its first frame is
     // the standing pose), so an idle + walking OBD keeps the walking group there instead of the idle one.
     let groups = thing.groups;
@@ -333,33 +394,38 @@ export class AssetProject {
       groups = [groups[1]!];
       warnings.push("O projeto não usa grupos de frames (cliente anterior ao 10.57): foi importado o grupo andando e o grupo parado foi omitido.");
     }
-    const referenced = new Set(groups.flatMap((group) => group.spriteIds));
-    const id = this.#dat.createRecord(category);
-    let addedSprites = 0;
-    try {
-      this.#dat.setFrameGroups(category, id, groups.map((group) => ({ ...group, spriteIds: group.spriteIds.map(() => 0) })));
-      const mapped = new Map<number, number>();
-      for (const [originalId, rgba] of thing.sprites) {
-        if (!referenced.has(originalId)) continue;
-        let blank = true;
-        for (let offset = 3; offset < rgba.length; offset += 4) {
-          if (rgba[offset] !== 0) { blank = false; break; }
-        }
-        if (originalId === 0 || blank) {
-          mapped.set(originalId, 0);
-        } else {
-          mapped.set(originalId, this.#spr.addSprite(rgba));
-          addedSprites += 1;
-        }
-      }
-      this.#dat.setFrameGroups(category, id, groups.map((group) => ({
-        ...group,
-        spriteIds: group.spriteIds.map((original) => mapped.get(original) ?? 0),
-      })));
-    } catch (error) {
-      this.#dat.removeRecord(category, id);
-      throw error;
+    const label = `${category} ${id}`;
+    const fileGroups: AnimationGroup[] = groups.map((group) => ({ ...group, ...(group.animation === undefined ? {} : { durations: group.animation.durations }) }));
+    const filePixels = (spriteId: number) => thing.sprites.get(spriteId);
+    let validation = `${groups.length} grupo(s) · ${groups[0]?.frames ?? 0} frame(s)`;
+    if (category === "outfits") {
+      const check = checkOutfitAnimation(label, fileGroups, filePixels);
+      if (check.errors.length > 0) throw new Error(`O .obd tem uma animação inválida: ${check.errors.join(" ")}`);
+      warnings.push(...check.warnings);
+      validation = check.summary;
     }
+    // Validates the layout before any sprite is added, so a rejected file leaves the SPR untouched.
+    this.#dat.setFrameGroups(category, id, groups.map((group) => ({ ...group, spriteIds: group.spriteIds.map(() => 0) })));
+    const referenced = new Set(groups.flatMap((group) => group.spriteIds));
+    const mapped = new Map<number, number>();
+    let addedSprites = 0;
+    for (const [originalId, rgba] of thing.sprites) {
+      if (!referenced.has(originalId)) continue;
+      let blank = true;
+      for (let offset = 3; offset < rgba.length; offset += 4) {
+        if (rgba[offset] !== 0) { blank = false; break; }
+      }
+      if (originalId === 0 || blank) {
+        mapped.set(originalId, 0);
+      } else {
+        mapped.set(originalId, this.#spr.addSprite(rgba));
+        addedSprites += 1;
+      }
+    }
+    this.#dat.setFrameGroups(category, id, groups.map((group) => ({
+      ...group,
+      spriteIds: group.spriteIds.map((original) => mapped.get(original) ?? 0),
+    })));
     for (const [name, value] of Object.entries(thing.properties)) {
       try {
         this.#dat.setProperty(category, id, name, value);
@@ -370,7 +436,16 @@ export class AssetProject {
     if (thing.clientVersion !== this.#clientVersion) {
       warnings.push(`O OBD foi criado para o cliente ${thing.clientVersion}; o projeto usa ${this.#clientVersion}.`);
     }
-    return { category, id, addedSprites, warnings };
+    // What was written must show exactly what the file contains: every group, direction, frame and sprite.
+    const written = this.#dat.getRecord(category, id)!;
+    const differences = compareAnimations(
+      label,
+      { groups: fileGroups, pixels: filePixels },
+      { groups: datAnimationGroups(written), pixels: (spriteId) => this.#spr.getSprite(spriteId) },
+      this.#otfi.settings.transparency,
+    );
+    if (differences.length > 0) throw new Error(`A importação não reproduziu o .obd: ${differences.join(" ")}`);
+    return { category, id, addedSprites, groups: groups.length, warnings, validation };
   }
 
   compile(): readonly CompiledProjectFile[] {

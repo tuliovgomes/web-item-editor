@@ -296,3 +296,37 @@ test("stages uploads per session so two tabs opening at once never mix their fil
     await editor.close();
   }
 });
+
+test("replaces a record with an uploaded .obd through the API", async () => {
+  const editor = createEditorServer();
+  const port = await editor.start(0);
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const source = AssetProject.create(1, { clientVersion: 1098 });
+  const sourceId = source.createRecord("items");
+  source.addSprite(Buffer.alloc(32 * 32 * 4, 255));
+  source.setSpriteId("items", sourceId, 0, 0, 1);
+  source.setProperty("items", sourceId, "isStackable", true);
+  const obd = source.exportObd("items", sourceId).data;
+
+  try {
+    const post = (path: string, body: unknown) => fetch(`${baseUrl}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    await post("/api/project/create", { clientVersion: 1098, signature: 1 });
+    await post("/api/project/record", { category: "items" });
+    const response = await fetch(`${baseUrl}/api/project/obd/replace?category=items&id=100`, {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: new Blob([Uint8Array.from(obd)]),
+    });
+    assert.equal(response.status, 200);
+    const result = await response.json() as { id: number; addedSprites: number; summary: { counts: { items: number } } };
+    assert.deepEqual([result.id, result.addedSprites, result.summary.counts.items], [100, 1, 1]);
+    const listed = await (await fetch(`${baseUrl}/api/project/records?category=items`)).json() as { records: Array<{ properties: Record<string, unknown> }> };
+    assert.equal(listed.records[0]?.properties["isStackable"], true);
+
+    const wrong = await fetch(`${baseUrl}/api/project/obd/replace?category=outfits&id=1`, { method: "POST", body: new Blob([Uint8Array.from(obd)]) });
+    assert.equal(wrong.status, 400);
+    assert.match((await wrong.json() as { error: string }).error, /contém um item, mas o registro é um outfit/);
+  } finally {
+    await editor.close();
+  }
+});

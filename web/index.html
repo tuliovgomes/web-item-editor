@@ -225,6 +225,7 @@
           <p class="eyebrow">PROPRIEDADES E FLAGS DAT</p>
           <h2 id="recordTitle">Selecione um registro</h2>
         </div>
+        <button id="replaceRecordObd" type="button" title="Troca grupos, frames, direções e propriedades pelo conteúdo de um .obd, mantendo o ID">Substituir por .obd…</button>
         <button id="removeRecord" class="danger">Excluir</button>
         <button id="closeModal" aria-label="Fechar">✕</button>
       </div>
@@ -249,6 +250,7 @@
       <div id="spriteReferences" class="sprite-references"></div>
     </dialog>
     <div id="spriteMenu" class="context-menu hidden" role="menu"></div>
+    <input id="replaceObdInput" type="file" accept=".obd" class="hidden">
     <div id="dropOverlay" class="drop-overlay hidden" aria-hidden="true"><p>Solte sprites (PNG/spritesheet) ou arquivos .obd para importar</p></div>
     <dialog id="spritePropsDialog" class="record-modal props-dialog">
       <div class="modal-head">

@@ -218,3 +218,49 @@ test("cuts 128×128 sprites out of a sheet and treats magenta as transparent", (
   assert.deepEqual([...first.rgba.subarray((4 * 128 + 4) * 4, (4 * 128 + 4) * 4 + 4)], [0, 4, 4, 255]);
   assert.equal(decodeSheet(sheet128()).width, 384);
 });
+
+test("replaces an outfit with an .obd keeping its ID, and leaves it untouched when the file is rejected", () => {
+  const record = outfitRecord();
+  const file = compressObd(buildObdPayload({
+    record: { ...record, properties: { isTranslucent: true } },
+    clientVersion: 1098,
+    spriteSize: 32,
+    getSprite: pixels,
+  }).raw);
+  const project = AssetProject.create(1, { clientVersion: 1098 });
+  const before = project.createRecord("outfits");
+  const target = project.createRecord("outfits");
+  const after = project.createRecord("outfits");
+  project.setProperty("outfits", target, "hasOffset", true);
+  const untouched = () => [before, after].map((id) => JSON.stringify(project.list("outfits", id - 1, 1)[0]));
+  const neighbours = untouched();
+
+  const result = project.replaceWithObd("outfits", target, file);
+  assert.deepEqual([result.id, result.groups, result.addedSprites], [target, 2, 288]);
+  assert.equal(project.summary.counts.outfits, 3, "no record is added");
+  const replaced = project.list("outfits", target - 1, 1)[0]!;
+  assert.deepEqual(replaced.groups.map((group) => [group.type, group.frames, group.spriteIds.length]), [[0, 1, 32], [1, 8, 256]]);
+  assert.equal(replaced.properties.isTranslucent, true);
+  assert.equal(replaced.properties.hasOffset, undefined, "old properties are replaced, not merged");
+  assert.deepEqual(project.getSprite(replaced.groups[1]!.spriteIds[255]!), pixels(record.groups[1]!.spriteIds[255]!));
+  assert.deepEqual(untouched(), neighbours);
+
+  // Survives a compile/reopen with the new layout.
+  const files = project.compile();
+  const reopened = AssetProject.open({ dat: files[0]!.data, spr: files[1]!.data, otfi: files[2]!.data }, { clientVersion: 1098 });
+  assert.equal(reopened.list("outfits", target - 1, 1)[0]!.groups[1]!.frames, 8);
+
+  const snapshot = JSON.stringify(project.list("outfits", target - 1, 1)[0]);
+  const sprites = project.summary.sprites.spriteCount;
+  const item = compressObd(buildObdPayload({
+    record: { id: 100, category: "items", flags: [], properties: {}, groups: [{ ...record.groups[0]!, type: 0 }] },
+    clientVersion: 1098,
+    spriteSize: 32,
+    getSprite: pixels,
+  }).raw);
+  assert.throws(() => project.replaceWithObd("outfits", target, item), /contém um item, mas o registro é um outfit/);
+  assert.throws(() => project.replaceWithObd("outfits", target, Buffer.from("not an obd")), /OBD/);
+  assert.throws(() => project.replaceWithObd("outfits", 99, file), /No outfits record with ID 99/);
+  assert.equal(JSON.stringify(project.list("outfits", target - 1, 1)[0]), snapshot, "a rejected file changes nothing");
+  assert.equal(project.summary.sprites.spriteCount, sprites, "and adds no sprite");
+});

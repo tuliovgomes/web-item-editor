@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { compress, decompress } from "lzma";
 import type { Appearance, FlagValue } from "./appearances.js";
 import type { DatCategory, DatGroupSpec, DatRecordView } from "./dat.js";
+import { checkOutfitAnimation, compareAnimations, type AnimationGroup, type AnimationReport } from "./animation-check.js";
 
 /**
  * Object Builder Data (OBD): a little-endian payload compressed as LZMA "alone"
@@ -182,6 +183,8 @@ export interface ObdPayload {
   readonly raw: Buffer;
   readonly warnings: string[];
   readonly spriteCount: number;
+  /** What the export check confirmed (e.g. "2 grupos · 4 direções · andando 8 frames"), when it ran. */
+  readonly validation?: string;
 }
 
 export function encodeObd(input: ObdEncodeInput, level: number = OBD_COMPRESSION_LEVEL): ObdEncodeResult {
@@ -372,6 +375,18 @@ export interface ModernObdInput {
 
 const MODERN_LOST_FLAGS = ["npcSaleData", "changedToExpire", "cyclopediaItem", "upgradeClassification", "skillwheelGem", "imbueable", "proficiency", "transparencyLevel", "weaponType"];
 
+/** One 32×32 cell of a larger sprite in DAT order: row/column 0 is the bottom-right corner of the image. */
+function cutCell(sprite: { width: number; rgba: Buffer }, cellsWide: number, cellsHigh: number, row: number, column: number): Buffer {
+  const cell = Buffer.alloc(OBD_PIXEL_BYTES);
+  const left = (cellsWide - 1 - column) * OBD_SPRITE_SIZE;
+  const top = (cellsHigh - 1 - row) * OBD_SPRITE_SIZE;
+  for (let y = 0; y < OBD_SPRITE_SIZE; y += 1) {
+    const start = ((top + y) * sprite.width + left) * 4;
+    sprite.rgba.copy(cell, y * OBD_SPRITE_SIZE * 4, start, start + OBD_SPRITE_SIZE * 4);
+  }
+  return cell;
+}
+
 function modernAnimation(group: Appearance["groups"][number]): ObdGroupLayout["animation"] {
   if (group.frames <= 1) return undefined;
   const animation = group.animation;
@@ -456,13 +471,7 @@ export function buildModernObdPayload(input: ModernObdInput): ObdPayload {
             writeSprite(output, version, 0, undefined);
             continue;
           }
-          const cell = Buffer.alloc(OBD_PIXEL_BYTES);
-          const left = (cellsWide - 1 - column) * OBD_SPRITE_SIZE;
-          const top = (cellsHigh - 1 - row) * OBD_SPRITE_SIZE;
-          for (let y = 0; y < OBD_SPRITE_SIZE; y += 1) {
-            const start = ((top + y) * sprite.width + left) * 4;
-            sprite.rgba.copy(cell, y * OBD_SPRITE_SIZE * 4, start, start + OBD_SPRITE_SIZE * 4);
-          }
+          const cell = cutCell(sprite, cellsWide, cellsHigh, row, column);
           const blank = cell.every((byte, offset) => offset % 4 !== 3 || byte === 0);
           writeSprite(output, version, blank ? 0 : cellIndex, blank ? undefined : cell);
         }
@@ -518,7 +527,12 @@ function fromLzma(file: Buffer): Buffer {
 }
 
 export function decodeObd(file: Buffer): ObdThing {
-  const reader = new Reader(fromLzma(file));
+  return decodeObdPayload(fromLzma(file));
+}
+
+/** Parses an uncompressed OBD payload (what `build*ObdPayload` returns before `compressObd`). */
+export function decodeObdPayload(raw: Buffer): ObdThing {
+  const reader = new Reader(raw);
   const obdVersion = reader.u16();
   if (obdVersion !== OBD_VERSION_2 && obdVersion !== OBD_VERSION_3) {
     throw new ObdFormatError(obdVersion >= 710
@@ -635,4 +649,82 @@ export function decodeObd(file: Buffer): ObdThing {
   if (reader.offset !== reader.buffer.length) throw new ObdFormatError("OBD has unexpected trailing data");
 
   return { obdVersion, clientVersion, category, properties, group: groups[0]!, groups, sprites };
+}
+
+/* ---------- Export checks: decode what was just built and compare it with the source ---------- */
+
+function decodedGroups(thing: ObdThing): AnimationGroup[] {
+  return thing.groups.map((group) => ({ ...group, ...(group.animation === undefined ? {} : { durations: group.animation.durations }) }));
+}
+
+function decodedPixels(thing: ObdThing): (id: number) => Buffer | undefined {
+  return (id) => thing.sprites.get(id);
+}
+
+/** Frame groups of a DAT record in the shape the animation checks use (with its frame durations, if any). */
+export function datAnimationGroups(record: DatRecordView): AnimationGroup[] {
+  return record.groups.map((group) => {
+    const animation = datAnimation(group);
+    return { ...group, ...(animation === undefined ? {} : { durations: animation.durations }) };
+  });
+}
+
+function report(label: string, category: DatCategory, groups: AnimationGroup[], pixels: (id: number) => Buffer | undefined, errors: string[]): AnimationReport {
+  const animation = category === "outfits"
+    ? checkOutfitAnimation(label, groups, pixels)
+    : { errors: [], warnings: [], summary: `${groups.length} grupo(s) · ${groups[0]?.frames ?? 0} frame(s)` };
+  return { errors: [...errors, ...animation.errors], warnings: animation.warnings, summary: animation.summary };
+}
+
+/**
+ * Checks a legacy export: the payload must decode back to the record's exact groups, layout, durations and pixels
+ * (so no frame, direction or sprite was dropped or swapped), and an outfit's movement is checked.
+ */
+export function validateObdPayload(input: ObdEncodeInput, payload: ObdPayload): AnimationReport {
+  const label = `${input.record.category} ${input.record.id}`;
+  const decoded = decodeObdPayload(payload.raw);
+  const groups = datAnimationGroups(input.record);
+  const pixels = (id: number) => (id === 0 ? undefined : input.getSprite(id));
+  const errors = compareAnimations(label, { groups, pixels }, { groups: decodedGroups(decoded), pixels: decodedPixels(decoded) });
+  return report(label, input.record.category, groups, pixels, errors);
+}
+
+/** Same check for an export from the client catalog, whose large sprites were cut into 32×32 cells. */
+export function validateModernObdPayload(input: ModernObdInput, payload: ObdPayload): AnimationReport {
+  const { appearance } = input;
+  const label = `${appearance.category} ${appearance.id}`;
+  const decoded = decodeObdPayload(payload.raw);
+  const sorted = [...appearance.groups].sort((a, b) => a.fixedFrameGroup - b.fixedFrameGroup);
+  const cells = new Map<number, Buffer>();
+  let next = 0;
+  const expected: AnimationGroup[] = sorted.map((group, groupIndex) => {
+    const width = decoded.groups[groupIndex]?.width ?? 1;
+    const height = decoded.groups[groupIndex]?.height ?? 1;
+    const spriteIds: number[] = [];
+    for (const spriteId of group.spriteIds) {
+      const sprite = spriteId === 0 ? undefined : input.getSprite(spriteId);
+      for (let row = 0; row < height; row += 1) {
+        for (let column = 0; column < width; column += 1) {
+          next += 1;
+          spriteIds.push(next);
+          if (sprite !== undefined) cells.set(next, cutCell(sprite, width, height, row, column));
+        }
+      }
+    }
+    const animation = modernAnimation(group);
+    return {
+      width, height, layers: group.layers, patternX: group.patternX, patternY: group.patternY, patternZ: group.patternZ,
+      frames: group.frames, spriteIds, ...(animation === undefined ? {} : { durations: animation.durations }),
+    };
+  });
+  const errors = compareAnimations(label, { groups: expected, pixels: (id) => cells.get(id) }, { groups: decodedGroups(decoded), pixels: decodedPixels(decoded) });
+  // The movement is judged on the client's own sprites (one whole image per slot).
+  const whole = sorted.map((group) => {
+    const animation = modernAnimation(group);
+    return {
+      width: 1, height: 1, layers: group.layers, patternX: group.patternX, patternY: group.patternY, patternZ: group.patternZ,
+      frames: group.frames, spriteIds: group.spriteIds, ...(animation === undefined ? {} : { durations: animation.durations }),
+    };
+  });
+  return report(label, appearance.category, whole, (id) => (id === 0 ? undefined : input.getSprite(id)?.rgba), errors);
 }

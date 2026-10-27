@@ -300,6 +300,14 @@ export class SprDocument {
     return this.#records.length;
   }
 
+  /** Drops the sprites appended after the first `count` (undoes `addSprite` calls of a failed operation). */
+  truncate(count: number): void {
+    if (!Number.isInteger(count) || count < 0) throw new SprFormatError("Sprite count must be a non-negative integer");
+    if (count >= this.#records.length) return;
+    this.#records.length = count;
+    this.#dirty = true;
+  }
+
   removeSprite(spriteId: number): void {
     const record = this.#records[spriteId - 1];
     if (record === undefined) throw new SprFormatError(`No SPR sprite with ID ${spriteId}`);
