@@ -92,8 +92,13 @@
               <select id="objectGroup" aria-label="Grupo de frames"></select>
               <select id="objectDirection" aria-label="Direção"></select>
             </div>
+            <div class="inline-control">
+              <select id="objectAddon" aria-label="Addon (padrão Y)"></select>
+              <select id="objectMount" aria-label="Montaria (padrão Z)"></select>
+            </div>
             <div class="canvas-frame"><canvas id="objectCanvas" width="32" height="32"></canvas></div>
             <p id="objectMeta" class="hint"></p>
+            <p id="objectFrame" class="hint" role="status"></p>
             <dl id="objectFlags" class="props-list"></dl>
             <p id="objectSprites" class="hint"></p>
           </div>
@@ -224,6 +229,21 @@
         <button id="closeModal" aria-label="Fechar">✕</button>
       </div>
       <div id="modalMessage" class="message" role="status"></div>
+      <div class="record-preview">
+        <div class="canvas-frame preview-frame"><canvas id="recordPreview" width="32" height="32"></canvas></div>
+        <div class="preview-controls">
+          <label>Grupo de frames <select id="previewGroup"></select></label>
+          <label>Direção <select id="previewDirection"></select></label>
+          <label id="previewAddonLabel">Addon (padrão Y) <select id="previewAddon"></select></label>
+          <label id="previewMountLabel">Montaria (padrão Z) <select id="previewMount"></select></label>
+          <div class="inline-control">
+            <button id="previewPrev" type="button" aria-label="Frame anterior">⏮</button>
+            <button id="previewPlay" type="button" aria-label="Pausar">⏸</button>
+            <button id="previewNext" type="button" aria-label="Próximo frame">⏭</button>
+          </div>
+          <p id="previewInfo" class="hint" role="status"></p>
+        </div>
+      </div>
       <div id="recordMeta" class="record-meta"></div>
       <div id="properties" class="properties"></div>
       <div id="spriteReferences" class="sprite-references"></div>

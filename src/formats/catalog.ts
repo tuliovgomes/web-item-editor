@@ -17,13 +17,18 @@ const LZMA_PROPERTY_BYTES = 5;
 const MAX_CATALOG_ENTRIES = 65_536;
 const MAX_CACHED_SHEETS = 24;
 
-/** Sprite pixel size per catalog `spritetype`. */
-const SPRITE_DIMENSIONS: Readonly<Record<number, readonly [number, number]>> = {
-  0: [32, 32],
-  1: [32, 64],
-  2: [64, 32],
-  3: [64, 64],
-};
+/**
+ * Sprite pixel size (width, height) per catalog `spritetype`. Types 0–3 are the classic layouts; newer clients
+ * (e.g. 15.x) also use the extended layouts 4–35 — every width/height pair of 32, 64, 96, 128, 192 and 384 that
+ * tiles a 384×384 sheet — for large outfits, mounts and effects. The order matches OTClient's `SpriteLayout`.
+ */
+const SPRITE_SIDES = [32, 64, 96, 128, 192, 384] as const;
+const SPRITE_DIMENSIONS: readonly (readonly [number, number])[] = [
+  [32, 32], [32, 64], [64, 32], [64, 64],
+  ...SPRITE_SIDES.flatMap((width) => SPRITE_SIDES
+    .filter((height) => !(width <= 64 && height <= 64))
+    .map((height) => [width, height] as const)),
+];
 
 export class CatalogFormatError extends Error {
   constructor(message: string) {
@@ -148,6 +153,8 @@ function decodeBmp(bmp: Buffer): { width: number; height: number; rgba: Buffer }
       rgba[target + 1] = (pixel & masks[1]!) >>> shifts[1]!;
       rgba[target + 2] = (pixel & masks[2]!) >>> shifts[2]!;
       rgba[target + 3] = masks[3] === 0 ? 255 : (pixel & masks[3]!) >>> shifts[3]!;
+      // Magenta is the sheets' transparency key (as in the client and OTClient), whatever its alpha says.
+      if (rgba[target] === 0xff && rgba[target + 1] === 0 && rgba[target + 2] === 0xff) rgba.fill(0, target, target + 4);
     }
   }
   return { width, height, rgba };

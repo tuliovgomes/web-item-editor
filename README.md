@@ -92,7 +92,7 @@ Refaça o build (`docker compose up -d --build`) só depois de mudar `package.js
 
 ### Limites do OBD
 
-Só o OBD v2 (LZMA, pixels ARGB 32×32). O OBD v1 não é suportado. Há apenas um grupo de frames (outfits com vários grupos exportam o grupo 0, com aviso). Bones, `npcSaleData`, `changer` e `podium` não existem no formato e são descartados com aviso. A versão do cliente gravada é a inferida do projeto. Flags não suportadas pela versão do projeto são ignoradas com aviso na importação.
+OBD v2 e v3 (LZMA, pixels ARGB 32×32). O OBD v1 não é suportado. Outfits com grupos parado e andando são exportados em v3 com os dois grupos (todas as direções, addons, montarias, frames e durações); os demais objetos continuam em v2. Num projeto anterior ao 10.57 (sem grupos de frames), a importação de um outfit com dois grupos mantém o grupo andando, com aviso. Bones, `npcSaleData`, `changer` e `podium` não existem no formato e são descartados com aviso. A versão do cliente gravada é a inferida do projeto. Flags não suportadas pela versão do projeto são ignoradas com aviso na importação.
 
 ### Conjuntos problemáticos
 

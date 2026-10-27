@@ -4,11 +4,18 @@ import type { Appearance, FlagValue } from "./appearances.js";
 import type { DatCategory, DatGroupSpec, DatRecordView } from "./dat.js";
 
 /**
- * Object Builder Data (OBD) version 2: a little-endian payload compressed as LZMA "alone"
+ * Object Builder Data (OBD): a little-endian payload compressed as LZMA "alone"
  * (13-byte header: properties, dictionary size, 64-bit uncompressed size).
- * Layout reference: ottools/ObjectBuilder, src/otlib/obd/OBDEncoder.as.
+ * Layout reference: ottools/ObjectBuilder, src/otlib/obd/OBDEncoder.as (checked against the `encodeV2`,
+ * `encodeV3` and `decodeV3` bytecode shipped in Object Builder 0.5.5).
+ * - v2 stores one frame group; each sprite is `u32 id` + 4096 ARGB bytes.
+ * - v3 adds, for outfits only, a `u8` group count and a `u8` type before each group (Object Builder reads groups
+ *   by position and ignores the type), and each sprite is `u32 id` + `u32 length` (4096) + ARGB bytes.
+ * The encoders write v3 only when an object has more than one frame group (outfits with idle and walking
+ * animations), so everything else stays readable by older Object Builder releases.
  */
 export const OBD_VERSION_2 = 200;
+export const OBD_VERSION_3 = 300;
 const MAX_OBD_SPRITES = 4096;
 const MAX_OBD_BYTES = 64 * 1024 * 1024;
 const OBD_SPRITE_SIZE = 32;
@@ -182,30 +189,34 @@ export function encodeObd(input: ObdEncodeInput, level: number = OBD_COMPRESSION
   return { data: compressObd(payload.raw, level), warnings: payload.warnings };
 }
 
-export function buildObdPayload(input: ObdEncodeInput): ObdPayload {
-  const { record, clientVersion } = input;
-  if (input.spriteSize !== OBD_SPRITE_SIZE) {
-    throw new ObdFormatError(`OBD only stores ${OBD_SPRITE_SIZE}×${OBD_SPRITE_SIZE} sprites; this project uses ${input.spriteSize}`);
-  }
-  const group = record.groups[0];
-  if (group === undefined) throw new ObdFormatError("Record has no sprite group");
-  if (group.spriteIds.length > MAX_OBD_SPRITES) throw new ObdFormatError(`OBD supports at most ${MAX_OBD_SPRITES} sprites per object`);
-  const warnings: string[] = [];
-  if (record.groups.length > 1) {
-    warnings.push(`${record.category} ${record.id}: OBD v2 guarda um grupo de frames; ${record.groups.length - 1} grupo(s) adicional(is) foram omitidos.`);
-  }
-  const lost = UNREPRESENTABLE.filter((name) => record.properties[name] === true);
-  if (lost.length > 0) warnings.push(`${record.category} ${record.id}: propriedades sem equivalente no OBD v2 foram omitidas (${lost.join(", ")}).`);
+interface ObdGroupLayout {
+  readonly width: number;
+  readonly height: number;
+  readonly exactSize: number;
+  readonly layers: number;
+  readonly patternX: number;
+  readonly patternY: number;
+  readonly patternZ: number;
+  readonly frames: number;
+  readonly animation?: {
+    readonly mode: number;
+    readonly loopCount: number;
+    readonly startFrame: number;
+    readonly durations: readonly (readonly [number, number])[];
+  };
+}
 
-  const output = new Writer();
-  output.u16(OBD_VERSION_2);
+function writeHeader(output: Writer, version: number, clientVersion: number, category: DatCategory, properties: Readonly<Record<string, PropertyValue>>): void {
+  output.u16(version);
   output.u16(clientVersion);
-  output.u8(CATEGORY_VALUES[record.category]);
+  output.u8(CATEGORY_VALUES[category]);
   const patternsPosition = output.length;
   output.u32(0);
-  writeProperties(output, record.properties as Readonly<Record<string, PropertyValue>>);
+  writeProperties(output, properties);
   output.patchU32(patternsPosition, output.length);
+}
 
+function writeGroupLayout(output: Writer, group: ObdGroupLayout): void {
   output.u8(group.width);
   output.u8(group.height);
   if (group.width > 1 || group.height > 1) output.u8(group.exactSize);
@@ -215,42 +226,78 @@ export function buildObdPayload(input: ObdEncodeInput): ObdPayload {
   output.u8(group.patternZ);
   output.u8(group.frames);
   if (group.frames > 1) {
-    const animation = group.animationData;
-    if (animation.length >= 6 + group.frames * 8) {
-      output.u8(animation.readUInt8(0));
-      output.u32(animation.readInt32LE(1));
-      output.u8(animation.readInt8(5));
-      for (let frame = 0; frame < group.frames; frame += 1) {
-        output.u32(animation.readUInt32LE(6 + frame * 8));
-        output.u32(animation.readUInt32LE(10 + frame * 8));
-      }
-    } else {
-      output.u8(0);
-      output.u32(0);
-      output.u8(0);
-      for (let frame = 0; frame < group.frames; frame += 1) {
-        output.u32(500);
-        output.u32(500);
-      }
+    output.u8(group.animation?.mode ?? 0);
+    output.u32(group.animation?.loopCount ?? 0);
+    output.u8(group.animation?.startFrame ?? 0);
+    for (let frame = 0; frame < group.frames; frame += 1) {
+      const [minimum, maximum] = group.animation?.durations[frame] ?? [500, 500];
+      output.u32(minimum);
+      output.u32(maximum);
     }
   }
+}
 
-  const empty = Buffer.alloc(OBD_PIXEL_BYTES);
-  for (const spriteId of group.spriteIds) {
-    const rgba = spriteId === 0 ? undefined : input.getSprite(spriteId);
-    if (rgba !== undefined && rgba.length !== OBD_PIXEL_BYTES) throw new ObdFormatError(`Sprite ${spriteId} has an unexpected size`);
-    const source = rgba ?? empty;
-    const argb = Buffer.alloc(OBD_PIXEL_BYTES);
+function writeSprite(output: Writer, version: number, id: number, rgba: Buffer | undefined): void {
+  const argb = Buffer.alloc(OBD_PIXEL_BYTES);
+  if (rgba !== undefined) {
     for (let offset = 0; offset < OBD_PIXEL_BYTES; offset += 4) {
-      argb[offset] = source[offset + 3]!;
-      argb[offset + 1] = source[offset]!;
-      argb[offset + 2] = source[offset + 1]!;
-      argb[offset + 3] = source[offset + 2]!;
+      argb[offset] = rgba[offset + 3]!;
+      argb[offset + 1] = rgba[offset]!;
+      argb[offset + 2] = rgba[offset + 1]!;
+      argb[offset + 3] = rgba[offset + 2]!;
     }
-    output.u32(spriteId);
-    output.raw(argb);
   }
-  return { raw: output.toBuffer(), warnings, spriteCount: group.spriteIds.length };
+  output.u32(id);
+  if (version === OBD_VERSION_3) output.u32(OBD_PIXEL_BYTES);
+  output.raw(argb);
+}
+
+/** Writes the group count and, before each group, its type (Object Builder writes the index; 1 for a lone group). */
+function groupPrefix(output: Writer, version: number, category: DatCategory, count: number, index: number): void {
+  if (version !== OBD_VERSION_3 || category !== "outfits") return;
+  if (index === 0) output.u8(count);
+  output.u8(count < 2 ? 1 : index);
+}
+
+/** Frame-duration block of a DAT group, as stored after the frame count (6 + 8 × frames bytes). */
+function datAnimation(group: DatRecordView["groups"][number]): ObdGroupLayout["animation"] {
+  const data = group.animationData;
+  if (group.frames <= 1 || data.length < 6 + group.frames * 8) return undefined;
+  const durations: [number, number][] = [];
+  for (let frame = 0; frame < group.frames; frame += 1) durations.push([data.readUInt32LE(6 + frame * 8), data.readUInt32LE(10 + frame * 8)]);
+  return { mode: data.readUInt8(0), loopCount: data.readInt32LE(1), startFrame: data.readInt8(5), durations };
+}
+
+export function buildObdPayload(input: ObdEncodeInput): ObdPayload {
+  const { record, clientVersion } = input;
+  if (input.spriteSize !== OBD_SPRITE_SIZE) {
+    throw new ObdFormatError(`OBD only stores ${OBD_SPRITE_SIZE}×${OBD_SPRITE_SIZE} sprites; this project uses ${input.spriteSize}`);
+  }
+  const groups = record.groups;
+  if (groups.length === 0) throw new ObdFormatError("Record has no sprite group");
+  for (const group of groups) {
+    if (group.spriteIds.length > MAX_OBD_SPRITES) throw new ObdFormatError(`OBD supports at most ${MAX_OBD_SPRITES} sprites per frame group`);
+  }
+  const version = groups.length > 1 ? OBD_VERSION_3 : OBD_VERSION_2;
+  const warnings: string[] = [];
+  const lost = UNREPRESENTABLE.filter((name) => record.properties[name] === true);
+  if (lost.length > 0) warnings.push(`${record.category} ${record.id}: propriedades sem equivalente no OBD foram omitidas (${lost.join(", ")}).`);
+
+  const output = new Writer();
+  writeHeader(output, version, clientVersion, record.category, record.properties as Readonly<Record<string, PropertyValue>>);
+  let spriteCount = 0;
+  groups.forEach((group, index) => {
+    groupPrefix(output, version, record.category, groups.length, index);
+    const animation = datAnimation(group);
+    writeGroupLayout(output, { ...group, ...(animation === undefined ? {} : { animation }) });
+    for (const spriteId of group.spriteIds) {
+      const rgba = spriteId === 0 ? undefined : input.getSprite(spriteId);
+      if (rgba !== undefined && rgba.length !== OBD_PIXEL_BYTES) throw new ObdFormatError(`Sprite ${spriteId} has an unexpected size`);
+      writeSprite(output, version, spriteId, rgba);
+      spriteCount += 1;
+    }
+  });
+  return { raw: output.toBuffer(), warnings, spriteCount };
 }
 
 const MODERN_BOOLEAN_FLAGS: readonly (readonly [string, string])[] = [
@@ -325,102 +372,104 @@ export interface ModernObdInput {
 
 const MODERN_LOST_FLAGS = ["npcSaleData", "changedToExpire", "cyclopediaItem", "upgradeClassification", "skillwheelGem", "imbueable", "proficiency", "transparencyLevel", "weaponType"];
 
+function modernAnimation(group: Appearance["groups"][number]): ObdGroupLayout["animation"] {
+  if (group.frames <= 1) return undefined;
+  const animation = group.animation;
+  const durations: [number, number][] = [];
+  for (let frame = 0; frame < group.frames; frame += 1) {
+    const phase = animation?.phases[frame];
+    durations.push([phase?.[0] ?? 500, phase?.[1] ?? 500]);
+  }
+  return {
+    mode: animation?.synchronized === true ? 1 : 0,
+    loopCount: animation === undefined || animation.loopType === 0 ? 0 : animation.loopType < 0 ? -1 : animation.loopCount,
+    startFrame: animation?.randomStartPhase === true ? -1 : (animation?.defaultStartPhase ?? 0),
+    durations,
+  };
+}
+
 /**
- * Builds an OBD v2 payload from a modern appearance. OBD only stores 32x32 sprites, so each
- * 64-pixel sprite is cut into 32x32 cells, ordered as the legacy DAT does (frame, z, y, x, layer,
- * then cell row and column, with column 0 at the right edge of the image).
+ * Builds an OBD payload from a modern appearance, keeping every frame group (idle and walking for outfits).
+ * OBD only stores 32x32 sprites, so each larger sprite is cut into 32x32 cells, ordered as the legacy DAT does
+ * (frame, z, y, x, layer, then cell row and column, with column 0 at the right edge of the image).
  */
 export function buildModernObdPayload(input: ModernObdInput): ObdPayload {
   const { appearance, clientVersion } = input;
-  const group = appearance.groups[0];
-  if (group === undefined) throw new ObdFormatError("O objeto não tem grupo de frames");
+  // The client's fixed frame group (0 idle, 1 moving) is the group's position in the legacy formats.
+  const groups = [...appearance.groups].sort((a, b) => a.fixedFrameGroup - b.fixedFrameGroup);
+  if (groups.length === 0) throw new ObdFormatError("O objeto não tem grupo de frames");
+  if (groups.length > 1 && appearance.category !== "outfits") throw new ObdFormatError("Somente outfits podem ter mais de um grupo de frames no OBD");
   const warnings: string[] = [];
   const label = `${appearance.category} ${appearance.id}`;
-  if (appearance.groups.length > 1) warnings.push(`${label}: OBD v2 guarda um grupo de frames; ${appearance.groups.length - 1} grupo(s) adicional(is) foram omitidos.`);
   const lost = MODERN_LOST_FLAGS.filter((name) => appearance.flags[name] !== undefined);
-  if (lost.length > 0) warnings.push(`${label}: flags sem equivalente no OBD v2 foram omitidas (${lost.join(", ")}).`);
+  if (lost.length > 0) warnings.push(`${label}: flags sem equivalente no OBD foram omitidas (${lost.join(", ")}).`);
+  const version = groups.length > 1 ? OBD_VERSION_3 : OBD_VERSION_2;
 
-  let cellsWide = 1;
-  let cellsHigh = 1;
-  for (const id of group.spriteIds) {
-    const sprite = id === 0 ? undefined : input.getSprite(id);
-    if (sprite !== undefined) {
-      cellsWide = Math.max(1, sprite.width / OBD_SPRITE_SIZE);
-      cellsHigh = Math.max(1, sprite.height / OBD_SPRITE_SIZE);
-      break;
+  const layouts = groups.map((group, groupIndex) => {
+    let cellsWide = 1;
+    let cellsHigh = 1;
+    for (const id of group.spriteIds) {
+      const sprite = id === 0 ? undefined : input.getSprite(id);
+      if (sprite !== undefined) {
+        cellsWide = Math.max(1, sprite.width / OBD_SPRITE_SIZE);
+        cellsHigh = Math.max(1, sprite.height / OBD_SPRITE_SIZE);
+        break;
+      }
     }
-  }
-  const cellCount = group.spriteIds.length * cellsWide * cellsHigh;
-  if (cellCount > MAX_OBD_SPRITES) throw new ObdFormatError(`OBD suporta no máximo ${MAX_OBD_SPRITES} sprites por objeto (este precisaria de ${cellCount})`);
-  if (group.patternX > 255 || group.patternY > 255 || group.patternZ > 255 || group.layers > 255 || group.frames > 255) {
-    throw new ObdFormatError("O padrão do objeto excede os limites do OBD");
-  }
+    const cellCount = group.spriteIds.length * cellsWide * cellsHigh;
+    const where = groups.length > 1 ? ` no grupo ${groupIndex + 1}` : "";
+    if (cellCount > MAX_OBD_SPRITES) {
+      throw new ObdFormatError(`OBD suporta no máximo ${MAX_OBD_SPRITES} sprites por grupo (${label} precisaria de ${cellCount}${where})`);
+    }
+    if (cellsWide > 255 || cellsHigh > 255 || group.patternX > 255 || group.patternY > 255 || group.patternZ > 255 || group.layers > 255 || group.frames > 255) {
+      throw new ObdFormatError("O padrão do objeto excede os limites do OBD");
+    }
+    return { group, cellsWide, cellsHigh };
+  });
 
   const output = new Writer();
-  output.u16(OBD_VERSION_2);
-  output.u16(clientVersion);
-  output.u8(CATEGORY_VALUES[appearance.category]);
-  const patternsPosition = output.length;
-  output.u32(0);
-  writeProperties(output, modernProperties(appearance.flags));
-  output.patchU32(patternsPosition, output.length);
-
-  output.u8(cellsWide);
-  output.u8(cellsHigh);
-  if (cellsWide > 1 || cellsHigh > 1) output.u8(Math.max(cellsWide, cellsHigh) * OBD_SPRITE_SIZE);
-  output.u8(group.layers);
-  output.u8(group.patternX);
-  output.u8(group.patternY);
-  output.u8(group.patternZ);
-  output.u8(group.frames);
-  if (group.frames > 1) {
-    const animation = group.animation;
-    output.u8(animation?.synchronized === true ? 1 : 0);
-    output.u32(animation === undefined || animation.loopType === 0 ? 0 : animation.loopType < 0 ? 0xffffffff : animation.loopCount);
-    output.u8(animation?.randomStartPhase === true ? 0xff : (animation?.defaultStartPhase ?? 0));
-    for (let frame = 0; frame < group.frames; frame += 1) {
-      const phase = animation?.phases[frame];
-      output.u32(phase?.[0] ?? 500);
-      output.u32(phase?.[1] ?? 500);
-    }
-  }
-
-  const cells: Buffer[] = [];
-  const empty = Buffer.alloc(OBD_PIXEL_BYTES);
-  for (const spriteId of group.spriteIds) {
-    const sprite = spriteId === 0 ? undefined : input.getSprite(spriteId);
-    if (sprite !== undefined && (sprite.width !== cellsWide * OBD_SPRITE_SIZE || sprite.height !== cellsHigh * OBD_SPRITE_SIZE)) {
-      throw new ObdFormatError(`Sprite ${spriteId} tem tamanho diferente das outras sprites do objeto`);
-    }
-    for (let row = 0; row < cellsHigh; row += 1) {
-      for (let column = 0; column < cellsWide; column += 1) {
-        if (sprite === undefined) { cells.push(empty); continue; }
-        const cell = Buffer.alloc(OBD_PIXEL_BYTES);
-        const left = (cellsWide - 1 - column) * OBD_SPRITE_SIZE;
-        const top = (cellsHigh - 1 - row) * OBD_SPRITE_SIZE;
-        for (let y = 0; y < OBD_SPRITE_SIZE; y += 1) {
-          const start = ((top + y) * sprite.width + left) * 4;
-          sprite.rgba.copy(cell, y * OBD_SPRITE_SIZE * 4, start, start + OBD_SPRITE_SIZE * 4);
+  writeHeader(output, version, clientVersion, appearance.category, modernProperties(appearance.flags));
+  let cellIndex = 0;
+  layouts.forEach(({ group, cellsWide, cellsHigh }, groupIndex) => {
+    groupPrefix(output, version, appearance.category, groups.length, groupIndex);
+    const animation = modernAnimation(group);
+    writeGroupLayout(output, {
+      width: cellsWide,
+      height: cellsHigh,
+      exactSize: Math.max(cellsWide, cellsHigh) * OBD_SPRITE_SIZE,
+      layers: group.layers,
+      patternX: group.patternX,
+      patternY: group.patternY,
+      patternZ: group.patternZ,
+      frames: group.frames,
+      ...(animation === undefined ? {} : { animation }),
+    });
+    for (const spriteId of group.spriteIds) {
+      const sprite = spriteId === 0 ? undefined : input.getSprite(spriteId);
+      if (sprite !== undefined && (sprite.width !== cellsWide * OBD_SPRITE_SIZE || sprite.height !== cellsHigh * OBD_SPRITE_SIZE)) {
+        throw new ObdFormatError(`Sprite ${spriteId} tem tamanho diferente das outras sprites do grupo`);
+      }
+      for (let row = 0; row < cellsHigh; row += 1) {
+        for (let column = 0; column < cellsWide; column += 1) {
+          cellIndex += 1;
+          if (sprite === undefined) {
+            writeSprite(output, version, 0, undefined);
+            continue;
+          }
+          const cell = Buffer.alloc(OBD_PIXEL_BYTES);
+          const left = (cellsWide - 1 - column) * OBD_SPRITE_SIZE;
+          const top = (cellsHigh - 1 - row) * OBD_SPRITE_SIZE;
+          for (let y = 0; y < OBD_SPRITE_SIZE; y += 1) {
+            const start = ((top + y) * sprite.width + left) * 4;
+            sprite.rgba.copy(cell, y * OBD_SPRITE_SIZE * 4, start, start + OBD_SPRITE_SIZE * 4);
+          }
+          const blank = cell.every((byte, offset) => offset % 4 !== 3 || byte === 0);
+          writeSprite(output, version, blank ? 0 : cellIndex, blank ? undefined : cell);
         }
-        cells.push(cell);
       }
     }
-  }
-  for (const [index, source] of cells.entries()) {
-    const blank = source === empty || source.every((byte, offset) => offset % 4 !== 3 || byte === 0);
-    const argb = Buffer.alloc(OBD_PIXEL_BYTES);
-    if (!blank) {
-      for (let offset = 0; offset < OBD_PIXEL_BYTES; offset += 4) {
-        argb[offset] = source[offset + 3]!;
-        argb[offset + 1] = source[offset]!;
-        argb[offset + 2] = source[offset + 1]!;
-        argb[offset + 3] = source[offset + 2]!;
-      }
-    }
-    output.u32(blank ? 0 : index + 1);
-    output.raw(argb);
-  }
-  return { raw: output.toBuffer(), warnings, spriteCount: cells.length };
+  });
+  return { raw: output.toBuffer(), warnings, spriteCount: cellIndex };
 }
 
 export interface ObdThing {
@@ -428,8 +477,10 @@ export interface ObdThing {
   readonly clientVersion: number;
   readonly category: DatCategory;
   readonly properties: Readonly<Record<string, PropertyValue>>;
-  /** Group layout; spriteIds are the IDs used inside the file (indices into `sprites`). */
+  /** First frame group (the only one in v2); spriteIds are the IDs used inside the file (keys of `sprites`). */
   readonly group: DatGroupSpec;
+  /** Every frame group in file order (idle then walking for v3 outfits), with `type` set to the position. */
+  readonly groups: readonly DatGroupSpec[];
   /** Distinct sprites keyed by their id inside the OBD file, as RGBA. */
   readonly sprites: ReadonlyMap<number, Buffer>;
 }
@@ -469,7 +520,7 @@ function fromLzma(file: Buffer): Buffer {
 export function decodeObd(file: Buffer): ObdThing {
   const reader = new Reader(fromLzma(file));
   const obdVersion = reader.u16();
-  if (obdVersion !== OBD_VERSION_2) {
+  if (obdVersion !== OBD_VERSION_2 && obdVersion !== OBD_VERSION_3) {
     throw new ObdFormatError(obdVersion >= 710
       ? "OBD v1 files are not supported yet; re-export the object from Object Builder as OBD v2"
       : `Unsupported OBD version ${obdVersion}`);
@@ -519,54 +570,56 @@ export function decodeObd(file: Buffer): ObdThing {
     }
   }
 
-  const width = reader.u8();
-  const height = reader.u8();
-  const exactSize = width > 1 || height > 1 ? reader.u8() : 32;
-  const layers = reader.u8();
-  const patternX = reader.u8();
-  const patternY = reader.u8();
-  const patternZ = reader.u8();
-  const frames = reader.u8();
-  if ([width, height, layers, patternX, patternY, patternZ, frames].some((value) => value === 0)) {
-    throw new ObdFormatError("OBD sprite layout dimensions must be non-zero");
-  }
-  let animation: DatGroupSpec["animation"];
-  if (frames > 1) {
-    const mode = reader.u8();
-    const loopCount = reader.i32();
-    const startFrame = reader.u8() << 24 >> 24;
-    const durations: [number, number][] = [];
-    for (let frame = 0; frame < frames; frame += 1) durations.push([reader.u32(), reader.u32()]);
-    animation = { mode, loopCount, startFrame, durations };
-  }
-  const total = width * height * layers * patternX * patternY * patternZ * frames;
-  if (total > MAX_OBD_SPRITES) throw new ObdFormatError(`OBD has more than ${MAX_OBD_SPRITES} sprites`);
-  reader.need(total * (4 + OBD_PIXEL_BYTES));
-
-  const spriteIds: number[] = [];
+  // v3 outfits carry a group count and, before each group, a type byte that Object Builder itself ignores.
+  const groupCount = obdVersion === OBD_VERSION_3 && category === "outfits" ? reader.u8() : 1;
+  if (groupCount === 0) throw new ObdFormatError("OBD outfit has no frame groups");
+  const groups: DatGroupSpec[] = [];
   const sprites = new Map<number, Buffer>();
-  for (let index = 0; index < total; index += 1) {
-    const id = reader.u32();
-    const argb = reader.bytes(OBD_PIXEL_BYTES);
-    spriteIds.push(id);
-    if (sprites.has(id)) continue;
-    const rgba = Buffer.alloc(OBD_PIXEL_BYTES);
-    for (let offset = 0; offset < OBD_PIXEL_BYTES; offset += 4) {
-      rgba[offset] = argb[offset + 1]!;
-      rgba[offset + 1] = argb[offset + 2]!;
-      rgba[offset + 2] = argb[offset + 3]!;
-      rgba[offset + 3] = argb[offset]!;
+  for (let groupIndex = 0; groupIndex < groupCount; groupIndex += 1) {
+    if (obdVersion === OBD_VERSION_3 && category === "outfits") reader.u8();
+    const width = reader.u8();
+    const height = reader.u8();
+    const exactSize = width > 1 || height > 1 ? reader.u8() : 32;
+    const layers = reader.u8();
+    const patternX = reader.u8();
+    const patternY = reader.u8();
+    const patternZ = reader.u8();
+    const frames = reader.u8();
+    if ([width, height, layers, patternX, patternY, patternZ, frames].some((value) => value === 0)) {
+      throw new ObdFormatError("OBD sprite layout dimensions must be non-zero");
     }
-    sprites.set(id, rgba);
-  }
-  if (reader.offset !== reader.buffer.length) throw new ObdFormatError("OBD has unexpected trailing data");
+    let animation: DatGroupSpec["animation"];
+    if (frames > 1) {
+      const mode = reader.u8();
+      const loopCount = reader.i32();
+      const startFrame = reader.u8() << 24 >> 24;
+      const durations: [number, number][] = [];
+      for (let frame = 0; frame < frames; frame += 1) durations.push([reader.u32(), reader.u32()]);
+      animation = { mode, loopCount, startFrame, durations };
+    }
+    const total = width * height * layers * patternX * patternY * patternZ * frames;
+    if (total > MAX_OBD_SPRITES) throw new ObdFormatError(`OBD has more than ${MAX_OBD_SPRITES} sprites in a frame group`);
+    const spriteBytes = obdVersion === OBD_VERSION_3 ? 8 + OBD_PIXEL_BYTES : 4 + OBD_PIXEL_BYTES;
+    reader.need(total * spriteBytes);
 
-  return {
-    obdVersion,
-    clientVersion,
-    category,
-    properties,
-    group: {
+    const spriteIds: number[] = [];
+    for (let index = 0; index < total; index += 1) {
+      const id = reader.u32();
+      if (obdVersion === OBD_VERSION_3 && reader.u32() !== OBD_PIXEL_BYTES) throw new ObdFormatError("OBD sprite has an invalid pixel data size");
+      const argb = reader.bytes(OBD_PIXEL_BYTES);
+      spriteIds.push(id);
+      if (sprites.has(id)) continue;
+      const rgba = Buffer.alloc(OBD_PIXEL_BYTES);
+      for (let offset = 0; offset < OBD_PIXEL_BYTES; offset += 4) {
+        rgba[offset] = argb[offset + 1]!;
+        rgba[offset + 1] = argb[offset + 2]!;
+        rgba[offset + 2] = argb[offset + 3]!;
+        rgba[offset + 3] = argb[offset]!;
+      }
+      sprites.set(id, rgba);
+    }
+    groups.push({
+      ...(groupCount > 1 ? { type: groupIndex } : {}),
       width,
       height,
       exactSize,
@@ -577,7 +630,9 @@ export function decodeObd(file: Buffer): ObdThing {
       frames,
       spriteIds,
       ...(animation === undefined ? {} : { animation }),
-    },
-    sprites,
-  };
+    });
+  }
+  if (reader.offset !== reader.buffer.length) throw new ObdFormatError("OBD has unexpected trailing data");
+
+  return { obdVersion, clientVersion, category, properties, group: groups[0]!, groups, sprites };
 }

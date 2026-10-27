@@ -186,8 +186,18 @@ function categoryRecord(record: ReturnType<AssetProject["list"]>[number]) {
       patternZ: group.patternZ,
       frames: group.frames,
       spriteIds: group.spriteIds,
+      animation: legacyAnimation(group),
     })),
   };
+}
+
+/** Frame durations of a DAT group (stored after the frame count since 10.50), in the shape of modern phases. */
+function legacyAnimation(group: ReturnType<AssetProject["list"]>[number]["groups"][number]) {
+  const data = group.animationData;
+  if (group.frames <= 1 || data.length < 6 + group.frames * 8) return null;
+  const phases: [number, number][] = [];
+  for (let frame = 0; frame < group.frames; frame += 1) phases.push([data.readUInt32LE(6 + frame * 8), data.readUInt32LE(10 + frame * 8)]);
+  return { loopCount: data.readInt32LE(1), startFrame: data.readInt8(5), phases };
 }
 
 function modernRecord(catalog: SpriteCatalog, entry: Appearance) {

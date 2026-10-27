@@ -28,6 +28,8 @@ export interface DatFrameGroup {
 }
 
 export interface DatGroupSpec {
+  /** Frame-group type for outfits with several groups (0 idle, 1 walking); defaults to the group's index. */
+  readonly type?: number;
   readonly width: number;
   readonly height: number;
   readonly exactSize: number;
@@ -1002,65 +1004,88 @@ export class DatDocument {
 
   /** Replaces the whole sprite layout of a record with a single frame group. */
   setFrameGroup(category: DatCategory, id: number, spec: DatGroupSpec): void {
+    this.setFrameGroups(category, id, [spec]);
+  }
+
+  /**
+   * Replaces the whole sprite layout of a record. Several groups are only valid for outfits in a layout with frame
+   * groups (10.57+), where group `type` 0 is idle and 1 is walking; it defaults to the group's index. A single
+   * group keeps the historical type 0.
+   */
+  setFrameGroups(category: DatCategory, id: number, specs: readonly DatGroupSpec[]): void {
     const index = category === "items" ? id - 100 : id - 1;
     const record = this.#records[category][index];
     if (record === undefined) throw new DatFormatError(`No ${category} record with ID ${id}`);
-    const byteFields = [spec.width, spec.height, spec.exactSize, spec.layers, spec.patternX, spec.patternY, spec.patternZ, spec.frames];
-    if (byteFields.some((value) => !Number.isInteger(value) || value < 0 || value > 255) ||
-      [spec.width, spec.height, spec.layers, spec.patternX, spec.patternY, spec.patternZ, spec.frames].some((value) => value === 0)) {
-      throw new DatFormatError("DAT group dimensions must be integers from 1 to 255");
-    }
-    const expected = spec.width * spec.height * spec.layers * spec.patternX * spec.patternY * spec.patternZ * spec.frames;
-    if (expected > MAX_SPRITES_PER_RECORD || spec.spriteIds.length !== expected) {
-      throw new DatFormatError(`DAT group needs exactly ${expected} sprite IDs (limit ${MAX_SPRITES_PER_RECORD})`);
+    const withGroups = category === "outfits" && this.#layout.frameGroups;
+    if (specs.length === 0 || specs.length > 255 || (specs.length > 1 && !withGroups)) {
+      throw new DatFormatError(withGroups
+        ? "DAT records need 1 to 255 frame groups"
+        : "Only outfits of clients with frame groups (10.57+) can have more than one frame group");
     }
     const maxId = this.#layout.extended ? 0xffff_ffff : 0xffff;
-    if (spec.spriteIds.some((value) => !Number.isInteger(value) || value < 0 || value > maxId)) {
-      throw new DatFormatError("DAT group sprite ID is out of range");
-    }
-    const withGroups = category === "outfits" && this.#layout.frameGroups;
-    const parts: Buffer[] = [];
-    if (withGroups) parts.push(Buffer.from([1, 0]));
-    parts.push(Buffer.from([spec.width, spec.height]));
-    if (spec.width > 1 || spec.height > 1) parts.push(Buffer.from([spec.exactSize]));
-    parts.push(Buffer.from([spec.layers, spec.patternX, spec.patternY, spec.patternZ, spec.frames]));
-    let animationData: Buffer = Buffer.alloc(0);
-    if (spec.frames > 1 && this.#layout.frameDurations) {
-      animationData = Buffer.alloc(6 + spec.frames * 8);
-      animationData.writeUInt8(spec.animation?.mode ?? 0, 0);
-      animationData.writeInt32LE(spec.animation?.loopCount ?? 0, 1);
-      animationData.writeInt8(spec.animation?.startFrame ?? 0, 5);
-      for (let frame = 0; frame < spec.frames; frame += 1) {
-        const [minimum, maximum] = spec.animation?.durations[frame] ?? [500, 500];
-        animationData.writeUInt32LE(minimum, 6 + frame * 8);
-        animationData.writeUInt32LE(maximum, 10 + frame * 8);
-      }
-      parts.push(animationData);
-    }
-    const header = Buffer.concat(parts);
     const idSize = this.#layout.extended ? 4 : 2;
-    const ids = Buffer.alloc(spec.spriteIds.length * idSize);
-    const offsets: number[] = [];
-    spec.spriteIds.forEach((spriteId, slot) => {
-      offsets.push(header.length + slot * idSize);
-      if (idSize === 4) ids.writeUInt32LE(spriteId, slot * idSize);
-      else ids.writeUInt16LE(spriteId, slot * idSize);
+    const parts: Buffer[] = [];
+    let length = 0;
+    const push = (part: Buffer) => { parts.push(part); length += part.length; };
+    if (withGroups) push(Buffer.from([specs.length]));
+    const groups: MutableFrameGroup[] = [];
+    specs.forEach((spec, groupIndex) => {
+      const byteFields = [spec.width, spec.height, spec.exactSize, spec.layers, spec.patternX, spec.patternY, spec.patternZ, spec.frames];
+      if (byteFields.some((value) => !Number.isInteger(value) || value < 0 || value > 255) ||
+        [spec.width, spec.height, spec.layers, spec.patternX, spec.patternY, spec.patternZ, spec.frames].some((value) => value === 0)) {
+        throw new DatFormatError("DAT group dimensions must be integers from 1 to 255");
+      }
+      const expected = spec.width * spec.height * spec.layers * spec.patternX * spec.patternY * spec.patternZ * spec.frames;
+      if (expected > MAX_SPRITES_PER_RECORD || spec.spriteIds.length !== expected) {
+        throw new DatFormatError(`DAT group needs exactly ${expected} sprite IDs (limit ${MAX_SPRITES_PER_RECORD})`);
+      }
+      if (spec.spriteIds.some((value) => !Number.isInteger(value) || value < 0 || value > maxId)) {
+        throw new DatFormatError("DAT group sprite ID is out of range");
+      }
+      const type = specs.length > 1 ? (spec.type ?? groupIndex) : 0;
+      if (!Number.isInteger(type) || type < 0 || type > 255) throw new DatFormatError("DAT frame-group type must be a byte");
+      if (withGroups) push(Buffer.from([type]));
+      push(Buffer.from([spec.width, spec.height]));
+      if (spec.width > 1 || spec.height > 1) push(Buffer.from([spec.exactSize]));
+      push(Buffer.from([spec.layers, spec.patternX, spec.patternY, spec.patternZ, spec.frames]));
+      let animationData: Buffer = Buffer.alloc(0);
+      if (spec.frames > 1 && this.#layout.frameDurations) {
+        animationData = Buffer.alloc(6 + spec.frames * 8);
+        animationData.writeUInt8(spec.animation?.mode ?? 0, 0);
+        animationData.writeInt32LE(spec.animation?.loopCount ?? 0, 1);
+        animationData.writeInt8(spec.animation?.startFrame ?? 0, 5);
+        for (let frame = 0; frame < spec.frames; frame += 1) {
+          const [minimum, maximum] = spec.animation?.durations[frame] ?? [500, 500];
+          animationData.writeUInt32LE(minimum, 6 + frame * 8);
+          animationData.writeUInt32LE(maximum, 10 + frame * 8);
+        }
+        push(animationData);
+      }
+      const ids = Buffer.alloc(spec.spriteIds.length * idSize);
+      const offsets: number[] = [];
+      spec.spriteIds.forEach((spriteId, slot) => {
+        offsets.push(length + slot * idSize);
+        if (idSize === 4) ids.writeUInt32LE(spriteId, slot * idSize);
+        else ids.writeUInt16LE(spriteId, slot * idSize);
+      });
+      push(ids);
+      groups.push({
+        type,
+        width: spec.width,
+        height: spec.height,
+        exactSize: spec.width > 1 || spec.height > 1 ? spec.exactSize : 32,
+        layers: spec.layers,
+        patternX: spec.patternX,
+        patternY: spec.patternY,
+        patternZ: spec.patternZ,
+        frames: spec.frames,
+        spriteIds: [...spec.spriteIds],
+        animationData,
+        spriteOffsets: offsets,
+      });
     });
-    record.groupData = Buffer.concat([header, ids]);
-    record.groups = [{
-      type: 0,
-      width: spec.width,
-      height: spec.height,
-      exactSize: spec.width > 1 || spec.height > 1 ? spec.exactSize : 32,
-      layers: spec.layers,
-      patternX: spec.patternX,
-      patternY: spec.patternY,
-      patternZ: spec.patternZ,
-      frames: spec.frames,
-      spriteIds: [...spec.spriteIds],
-      animationData,
-      spriteOffsets: offsets,
-    }];
+    record.groupData = Buffer.concat(parts);
+    record.groups = groups;
     this.#dirty = true;
   }
 

@@ -569,7 +569,7 @@ $("#catalogGo").addEventListener("click", () => {
   gotoCatalogId(Number($("#catalogSpriteId").value)).catch((error) => setMessage(error.message, "error"));
 });
 
-const objectsState = { category: "items", page: 0, pageSize: 60, total: 0, records: [], selected: null, token: 0, timer: null, picked: new Set(), anchor: null, clientVersion: 0, exporting: false };
+const objectsState = { category: "items", page: 0, pageSize: 60, total: 0, records: [], selected: null, token: 0, timer: null, playToken: 0, picked: new Set(), anchor: null, clientVersion: 0, exporting: false };
 
 function applyObjectsSummary(summary) {
   const card = $("#objectsCard");
@@ -713,7 +713,7 @@ function renderObjectGrid() {
       if (!entry.isIntersecting) continue;
       observer.unobserve(entry.target);
       const record = records[Number(entry.target.dataset.index)];
-      const group = record.groups[0];
+      const group = record.groups[previewGroupIndex(record)];
       if (!group || token !== objectsState.token) continue;
       drawObject(entry.target.querySelector("canvas"), record, group, { x: defaultDirection(record, group) }, 48).catch(() => {});
     }
@@ -737,6 +737,7 @@ function renderObjectGrid() {
 function stopObjectAnimation() {
   clearTimeout(objectsState.timer);
   objectsState.timer = null;
+  objectsState.playToken += 1;
 }
 
 function flagText(value) {
@@ -750,7 +751,9 @@ function selectObject(record) {
   stopObjectAnimation();
   $("#objectTitle").textContent = `${record.category} #${record.id}${record.name ? ` · ${record.name}` : ""}`;
   const groupSelect = $("#objectGroup");
-  groupSelect.replaceChildren(...record.groups.map((group, index) => new Option(`Grupo ${index + 1}${group.frames > 1 ? ` (${group.frames} frames)` : ""}`, String(index))));
+  groupSelect.replaceChildren(...record.groups.map((group, index) => new Option(frameGroupLabel(record.category, group, index, record.groups.length), String(index))));
+  groupSelect.value = String(previewGroupIndex(record));
+  groupSelect.disabled = record.groups.length <= 1;
   const flags = $("#objectFlags");
   flags.replaceChildren();
   for (const [name, value] of Object.entries(record.flags)) {
@@ -761,7 +764,7 @@ function selectObject(record) {
     flags.append(term, detail);
   }
   if (!Object.keys(record.flags).length) $("#objectFlags").textContent = "Sem flags.";
-  selectObjectGroup(0);
+  selectObjectGroup(previewGroupIndex(record));
 }
 
 function selectObjectGroup(index) {
@@ -769,10 +772,13 @@ function selectObjectGroup(index) {
   const group = record?.groups[index];
   stopObjectAnimation();
   if (!group) return;
-  const directions = $("#objectDirection");
-  const names = record.category === "outfits" && group.patternX === 4 ? ["Norte", "Leste", "Sul", "Oeste"] : [];
-  directions.replaceChildren(...Array.from({ length: group.patternX }, (_, x) => new Option(names[x] ?? `Padrão X ${x}`, String(x))));
-  directions.value = String(defaultDirection(record, group));
+  const outfit = record.category === "outfits";
+  fillPatternSelect($("#objectDirection"), group.patternX,
+    (x) => (outfit && group.patternX === 4 ? DIRECTION_NAMES[x] : `Padrão X ${x}`), defaultDirection(record, group));
+  fillPatternSelect($("#objectAddon"), group.patternY, (y) => (outfit ? (y === 0 ? "Sem addon" : `Addon ${y}`) : `Padrão Y ${y}`), 0);
+  fillPatternSelect($("#objectMount"), group.patternZ, (z) => (outfit ? (z === 0 ? "Sem montaria" : `Montado${group.patternZ > 2 ? ` ${z}` : ""}`) : `Padrão Z ${z}`), 0);
+  $("#objectAddon").classList.toggle("hidden", group.patternY <= 1);
+  $("#objectMount").classList.toggle("hidden", group.patternZ <= 1);
   $("#objectMeta").textContent = `${group.width * 32}×${group.height * 32}px · camadas ${group.layers} · padrão ${group.patternX}×${group.patternY}×${group.patternZ} · frames ${group.frames}`;
   $("#objectSprites").textContent = `Sprites: ${group.spriteIds.length > 24 ? `${group.spriteIds.slice(0, 24).join(", ")}… (${group.spriteIds.length})` : group.spriteIds.join(", ")}`;
   playObject(record, group);
@@ -781,11 +787,15 @@ function selectObjectGroup(index) {
 function playObject(record, group) {
   const canvas = $("#objectCanvas");
   const x = Number($("#objectDirection").value);
+  const y = Number($("#objectAddon").value) || 0;
+  const z = Number($("#objectMount").value) || 0;
+  const token = objectsState.playToken;
   let frame = 0;
   const step = async () => {
-    if (objectsState.selected !== record) return;
+    if (objectsState.selected !== record || objectsState.playToken !== token) return;
+    $("#objectFrame").textContent = `Frame ${frame + 1}/${group.frames}${group.frames > 1 ? (group.animation ? " · durações do arquivo" : " · durações padrão") : ""}`;
     try {
-      const id = groupSpriteId(group, { frame, x });
+      const id = groupSpriteId(group, { frame, x, y, z });
       if (id) {
         const sprite = await fetchCatalogSprite(id);
         drawCatalogSprite(canvas, sprite, Math.min(224, Math.max(sprite.width, sprite.height) * 4));
@@ -795,10 +805,11 @@ function playObject(record, group) {
     } catch {
       // Missing sprite sheets leave the previous frame in place.
     }
-    if (group.frames <= 1) return;
-    const [min, max] = group.animation?.phases[frame] ?? [100, 100];
+    // A newer play (other group/direction) may have started while this frame was loading.
+    if (group.frames <= 1 || objectsState.selected !== record || objectsState.playToken !== token) return;
+    const delay = frameDuration(record, group, frame);
     frame = (frame + 1) % group.frames;
-    objectsState.timer = setTimeout(step, Math.max(40, (min + max) / 2));
+    objectsState.timer = setTimeout(step, delay);
   };
   step();
 }
@@ -811,11 +822,13 @@ $("#objectsGrid").addEventListener("click", (event) => {
   selectObject(record);
 });
 $("#objectGroup").addEventListener("change", () => selectObjectGroup(Number($("#objectGroup").value)));
-$("#objectDirection").addEventListener("change", () => {
-  const record = objectsState.selected;
-  stopObjectAnimation();
-  if (record) playObject(record, record.groups[Number($("#objectGroup").value)]);
-});
+for (const selector of ["#objectDirection", "#objectAddon", "#objectMount"]) {
+  $(selector).addEventListener("change", () => {
+    const record = objectsState.selected;
+    stopObjectAnimation();
+    if (record) playObject(record, record.groups[Number($("#objectGroup").value)]);
+  });
+}
 $("#objectsCategory").addEventListener("change", () => {
   objectsState.category = $("#objectsCategory").value;
   objectsState.picked.clear();
@@ -999,39 +1012,72 @@ async function fetchSpriteRgba(id) {
   return data;
 }
 
-// Outfit patternX is the direction (0 north/back, 1 east, 2 south/front, 3 west).
-function frameSpriteIds(record, group, frame) {
+/* Frame composition for DAT records. Sprite order inside a group (as in the client and Object Builder):
+   frame, pattern Z (mount), pattern Y (addon), pattern X (direction), layer, tile row, tile column; tile (0, 0)
+   is the bottom-right 32×32 cell of the image. Outfit layers above 0 are color masks and are not drawn. */
+
+const DIRECTION_NAMES = ["Norte", "Leste", "Sul", "Oeste"];
+
+/** The group previews and thumbnails show first: an outfit's walking animation when it has one. */
+function previewGroupIndex(record) {
+  if (record.category === "outfits" && record.groups.length > 1) {
+    const walking = record.groups.findIndex((group) => group.type === 1);
+    if (walking >= 0) return walking;
+  }
+  return 0;
+}
+
+function frameGroupLabel(category, group, index, count) {
+  const frames = `${group.frames} frame${group.frames === 1 ? "" : "s"}`;
+  if (category === "outfits" && count > 1) {
+    const name = group.type === 0 ? "Parado" : group.type === 1 ? "Andando" : `Grupo ${index + 1}`;
+    return `${name} · ${frames}`;
+  }
+  return `Grupo ${index + 1} · ${frames}`;
+}
+
+/** Milliseconds to show `frame`: the file's min/max duration when it has one, a sensible default otherwise. */
+function frameDuration(record, group, frame) {
+  const phase = group.animation?.phases?.[frame];
+  if (phase) return Math.max(40, (phase[0] + phase[1]) / 2);
+  return record.category === "outfits" ? 200 : 500;
+}
+
+function legacyFrameCells(record, group, { frame = 0, x = 0, y = 0, z = 0 } = {}) {
   const width = Math.max(1, group.width);
   const height = Math.max(1, group.height);
-  const direction = record.category === "outfits" && group.patternX >= 3 ? 2 : 0;
-  const perCell = group.layers;
+  const layers = record.category === "outfits" ? 1 : group.layers;
   const cells = [];
-  for (let h = 0; h < height; h += 1) {
-    for (let w = 0; w < width; w += 1) {
-      const index = ((((frame * group.patternZ) * group.patternY) * group.patternX + direction) * perCell) * height * width + h * width + w;
-      cells.push({ w, h, id: group.spriteIds[index] });
+  for (let layer = 0; layer < layers; layer += 1) {
+    const base = (((((frame % group.frames) * group.patternZ + z) * group.patternY + y) * group.patternX + x) * group.layers + layer) * height * width;
+    for (let h = 0; h < height; h += 1) {
+      for (let w = 0; w < width; w += 1) cells.push({ w, h, id: group.spriteIds[base + h * width + w] });
     }
   }
   return { width, height, cells };
 }
 
-async function drawThumbnail(canvas, record, frame = 0) {
-  const group = record.groups[0];
+async function drawLegacyFrame(canvas, record, group, pattern) {
   const size = state.spriteInfo.spriteSize;
-  if (!group) return;
-  const { width, height, cells } = frameSpriteIds(record, group, frame % Math.max(1, group.frames));
+  const { width, height, cells } = legacyFrameCells(record, group, pattern);
   const buffer = document.createElement("canvas");
   buffer.width = size * width;
   buffer.height = size * height;
   const bufferContext = buffer.getContext("2d");
+  const tile = document.createElement("canvas");
+  tile.width = size;
+  tile.height = size;
+  const tileContext = tile.getContext("2d");
   for (const cell of cells) {
     if (!cell.id) continue;
     try {
       const rgba = await fetchSpriteRgba(cell.id);
-      bufferContext.putImageData(new ImageData(new Uint8ClampedArray(rgba), size, size), (width - 1 - cell.w) * size, (height - 1 - cell.h) * size);
+      // drawImage (not putImageData) so stacked layers blend instead of replacing each other.
+      tileContext.putImageData(new ImageData(new Uint8ClampedArray(rgba), size, size), 0, 0);
+      bufferContext.drawImage(tile, (width - 1 - cell.w) * size, (height - 1 - cell.h) * size);
     } catch (error) {
-      if (error?.name === "ServerUnavailableError") return;
-      // Missing sprites stay transparent in the thumbnail.
+      if (error?.name === "ServerUnavailableError") return false;
+      // Missing sprites stay transparent.
     }
   }
   if (canvas.width !== buffer.width) canvas.width = buffer.width;
@@ -1039,29 +1085,13 @@ async function drawThumbnail(canvas, record, frame = 0) {
   const context = canvas.getContext("2d");
   context.clearRect(0, 0, canvas.width, canvas.height);
   context.drawImage(buffer, 0, 0);
+  return true;
 }
 
-const animations = new WeakMap();
-
-function stopAnimation(canvas) {
-  const timer = animations.get(canvas);
-  if (timer) clearInterval(timer);
-  animations.delete(canvas);
-}
-
-function startAnimation(canvas, record) {
-  stopAnimation(canvas);
-  const frames = record.groups[0]?.frames ?? 1;
-  if (frames <= 1) return;
-  let frame = 0;
-  let busy = false;
-  animations.set(canvas, setInterval(async () => {
-    if (busy) return;
-    busy = true;
-    frame = (frame + 1) % frames;
-    await drawThumbnail(canvas, record, frame);
-    busy = false;
-  }, 250));
+async function drawThumbnail(canvas, record, frame = 0) {
+  const group = record.groups[previewGroupIndex(record)];
+  if (!group) return;
+  await drawLegacyFrame(canvas, record, group, { frame, x: defaultDirection(record, group) });
 }
 
 let thumbObserver;
@@ -1070,7 +1100,7 @@ const visibleTiles = new Map();
 // One shared timer animates only the tiles currently scrolled into view.
 setInterval(() => {
   for (const [tile, entry] of visibleTiles) {
-    const frames = entry.record.groups[0]?.frames ?? 1;
+    const frames = entry.record.groups[previewGroupIndex(entry.record)]?.frames ?? 1;
     if (frames <= 1 || entry.busy || !tile.isConnected) continue;
     entry.busy = true;
     entry.frame = (entry.frame + 1) % frames;
@@ -1225,7 +1255,116 @@ function renderRecord(record) {
   });
   renderProperties(record);
   renderSpriteReferences(record);
-  drawThumbnail($("#modalThumb"), record).then(() => startAnimation($("#modalThumb"), record));
+  drawThumbnail($("#modalThumb"), record);
+  setupRecordPreview(record);
+}
+
+/* Animated preview of a DAT record: every frame group, direction, addon and mount, with the file's durations.
+   Re-rendering the same record (after an edit) keeps the chosen group, pattern and frame. */
+
+const recordPreview = { key: null, record: null, group: 0, x: 0, y: 0, z: 0, frame: 0, playing: true, timer: null, token: 0 };
+
+function fillPatternSelect(select, count, name, value) {
+  select.replaceChildren(...Array.from({ length: count }, (_, index) => new Option(name(index), String(index))));
+  select.value = String(value);
+  select.disabled = count <= 1;
+}
+
+function setupRecordPreview(record) {
+  const preview = recordPreview;
+  const key = `${record.category}:${record.id}`;
+  const same = preview.key === key;
+  preview.key = key;
+  preview.record = record;
+  if (!same) {
+    preview.group = previewGroupIndex(record);
+    preview.frame = 0;
+    preview.playing = true;
+  }
+  preview.group = Math.min(preview.group, Math.max(0, record.groups.length - 1));
+  $("#previewGroup").replaceChildren(...record.groups.map((group, index) =>
+    new Option(frameGroupLabel(record.category, group, index, record.groups.length), String(index))));
+  $("#previewGroup").value = String(preview.group);
+  $("#previewGroup").disabled = record.groups.length <= 1;
+  configurePreviewPatterns(same);
+  restartRecordPreview();
+}
+
+function configurePreviewPatterns(keep) {
+  const preview = recordPreview;
+  const { record } = preview;
+  const group = record.groups[preview.group];
+  if (!group) return;
+  const outfit = record.category === "outfits";
+  preview.x = keep && preview.x < group.patternX ? preview.x : defaultDirection(record, group);
+  preview.y = keep && preview.y < group.patternY ? preview.y : 0;
+  preview.z = keep && preview.z < group.patternZ ? preview.z : 0;
+  preview.frame %= group.frames;
+  fillPatternSelect($("#previewDirection"), group.patternX,
+    (x) => (outfit && group.patternX === 4 ? DIRECTION_NAMES[x] : `Padrão X ${x}`), preview.x);
+  fillPatternSelect($("#previewAddon"), group.patternY, (y) => (outfit ? (y === 0 ? "Sem addon" : `Addon ${y}`) : `Padrão Y ${y}`), preview.y);
+  fillPatternSelect($("#previewMount"), group.patternZ, (z) => (outfit ? (z === 0 ? "Sem montaria" : `Montado${group.patternZ > 2 ? ` ${z}` : ""}`) : `Padrão Z ${z}`), preview.z);
+  $("#previewAddonLabel").classList.toggle("hidden", group.patternY <= 1);
+  $("#previewMountLabel").classList.toggle("hidden", group.patternZ <= 1);
+}
+
+function stopRecordPreview() {
+  clearTimeout(recordPreview.timer);
+  recordPreview.timer = null;
+  recordPreview.token += 1;
+}
+
+function restartRecordPreview() {
+  stopRecordPreview();
+  const token = recordPreview.token;
+  const step = async () => {
+    const preview = recordPreview;
+    const { record } = preview;
+    const group = record?.groups[preview.group];
+    if (!group || token !== preview.token) return;
+    const pattern = { frame: preview.frame, x: preview.x, y: preview.y, z: preview.z };
+    await drawLegacyFrame($("#recordPreview"), record, group, pattern);
+    if (token !== preview.token) return;
+    const durations = group.animation ? "durações do arquivo" : "durações padrão";
+    $("#previewInfo").textContent = `Frame ${preview.frame + 1}/${group.frames} · ${group.width}×${group.height} tile(s) · ${group.layers} camada(s) · padrão ${group.patternX}×${group.patternY}×${group.patternZ} · ${group.spriteIds.length} sprites no grupo${group.frames > 1 ? ` · ${durations}` : ""}`;
+    $("#previewPlay").textContent = preview.playing ? "⏸" : "▶";
+    $("#previewPlay").setAttribute("aria-label", preview.playing ? "Pausar" : "Reproduzir");
+    $("#previewPlay").disabled = group.frames <= 1;
+    $("#previewPrev").disabled = group.frames <= 1;
+    $("#previewNext").disabled = group.frames <= 1;
+    if (!preview.playing || group.frames <= 1) return;
+    preview.timer = setTimeout(() => {
+      preview.frame = (preview.frame + 1) % group.frames;
+      step();
+    }, frameDuration(record, group, preview.frame));
+  };
+  step();
+}
+
+$("#previewGroup").addEventListener("change", () => {
+  recordPreview.group = Number($("#previewGroup").value);
+  recordPreview.frame = 0;
+  configurePreviewPatterns(true);
+  restartRecordPreview();
+});
+for (const [selector, key] of [["#previewDirection", "x"], ["#previewAddon", "y"], ["#previewMount", "z"]]) {
+  $(selector).addEventListener("change", () => {
+    recordPreview[key] = Number($(selector).value);
+    restartRecordPreview();
+  });
+}
+$("#previewPlay").addEventListener("click", () => {
+  recordPreview.playing = !recordPreview.playing;
+  restartRecordPreview();
+});
+for (const [selector, delta] of [["#previewPrev", -1], ["#previewNext", 1]]) {
+  $(selector).addEventListener("click", () => {
+    const group = recordPreview.record?.groups[recordPreview.group];
+    if (!group) return;
+    recordPreview.playing = false;
+    recordPreview.frame = (recordPreview.frame + delta + group.frames) % group.frames;
+    restartRecordPreview();
+  });
 }
 
 function renderProperties(record) {
@@ -1697,7 +1836,10 @@ $("#pageInput").addEventListener("change", (event) => {
 });
 
 $("#closeModal").addEventListener("click", () => $("#recordModal").close());
-$("#recordModal").addEventListener("close", () => stopAnimation($("#modalThumb")));
+$("#recordModal").addEventListener("close", () => {
+  stopRecordPreview();
+  recordPreview.key = null;
+});
 $("#addRecord").addEventListener("click", addRecord);
 $("#removeRecord").addEventListener("click", removeRecord);
 $("#loadSprite").addEventListener("click", () => loadSprite(Number($("#spriteId").value)).catch((error) => setMessage(error.message, "error")));

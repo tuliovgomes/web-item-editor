@@ -326,12 +326,21 @@ export class AssetProject {
     }
     const warnings: string[] = [];
     const category = thing.category;
+    // Clients before 10.57 keep one group per outfit, and that group is the walking animation (its first frame is
+    // the standing pose), so an idle + walking OBD keeps the walking group there instead of the idle one.
+    let groups = thing.groups;
+    if (groups.length > 1 && !this.#otfi.settings.frameGroups) {
+      groups = [groups[1]!];
+      warnings.push("O projeto não usa grupos de frames (cliente anterior ao 10.57): foi importado o grupo andando e o grupo parado foi omitido.");
+    }
+    const referenced = new Set(groups.flatMap((group) => group.spriteIds));
     const id = this.#dat.createRecord(category);
     let addedSprites = 0;
     try {
-      this.#dat.setFrameGroup(category, id, { ...thing.group, spriteIds: thing.group.spriteIds.map(() => 0) });
+      this.#dat.setFrameGroups(category, id, groups.map((group) => ({ ...group, spriteIds: group.spriteIds.map(() => 0) })));
       const mapped = new Map<number, number>();
       for (const [originalId, rgba] of thing.sprites) {
+        if (!referenced.has(originalId)) continue;
         let blank = true;
         for (let offset = 3; offset < rgba.length; offset += 4) {
           if (rgba[offset] !== 0) { blank = false; break; }
@@ -343,10 +352,10 @@ export class AssetProject {
           addedSprites += 1;
         }
       }
-      this.#dat.setFrameGroup(category, id, {
-        ...thing.group,
-        spriteIds: thing.group.spriteIds.map((original) => mapped.get(original) ?? 0),
-      });
+      this.#dat.setFrameGroups(category, id, groups.map((group) => ({
+        ...group,
+        spriteIds: group.spriteIds.map((original) => mapped.get(original) ?? 0),
+      })));
     } catch (error) {
       this.#dat.removeRecord(category, id);
       throw error;
