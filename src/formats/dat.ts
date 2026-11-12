@@ -9,7 +9,7 @@ export type DatCategory = "items" | "outfits" | "effects" | "missiles";
 
 export interface DatParseOptions {
   readonly clientVersion: number;
-  readonly otfi?: Pick<OtfiSettings, "extended" | "frameDurations" | "frameGroups">;
+  readonly otfi?: Pick<OtfiSettings, "extended" | "frameDurations" | "frameGroups" | "extendedItems">;
   readonly maxFileBytes?: number;
 }
 
@@ -697,6 +697,7 @@ function resolveLayout(options: DatParseOptions): {
   extended: boolean;
   frameDurations: boolean;
   frameGroups: boolean;
+  extendedItems: boolean;
 } {
   if (!Number.isInteger(options.clientVersion) || options.clientVersion < 1) {
     throw new DatFormatError("clientVersion must be a positive integer");
@@ -706,11 +707,13 @@ function resolveLayout(options: DatParseOptions): {
         extended: options.clientVersion >= 960,
         frameDurations: options.clientVersion >= 1050,
         frameGroups: options.clientVersion >= 1057,
+        extendedItems: false,
       }
     : {
         extended: options.otfi.extended,
         frameDurations: options.otfi.frameDurations,
         frameGroups: options.otfi.frameGroups,
+        extendedItems: options.otfi.extendedItems === true,
       };
 }
 
@@ -867,6 +870,31 @@ function recordView(record: MutableRecord, id: number): DatRecordView {
   };
 }
 
+/** Signature (u32), max item ID (u16, or u32 with `extended-items`), then max outfit/effect/missile IDs (u16). */
+function datHeader(signature: number, maxima: readonly number[], extendedItems: boolean): Buffer {
+  const itemLimit = extendedItems ? 0xffff_ffff : 0xffff;
+  if (maxima[0]! > itemLimit || maxima.slice(1).some((value) => value > 0xffff)) {
+    throw new DatFormatError(
+      `DAT category maximum ID exceeds the header limit${extendedItems ? "" : " (enable extended-items in the OTFI for more than 65535 items)"}`,
+    );
+  }
+  const header = Buffer.alloc(extendedItems ? 14 : 12);
+  header.writeUInt32LE(signature, 0);
+  let offset = 4;
+  if (extendedItems) {
+    header.writeUInt32LE(maxima[0]!, offset);
+    offset += 4;
+  } else {
+    header.writeUInt16LE(maxima[0]!, offset);
+    offset += 2;
+  }
+  for (const value of maxima.slice(1)) {
+    header.writeUInt16LE(value, offset);
+    offset += 2;
+  }
+  return header;
+}
+
 export class DatDocument {
   readonly #signature: number;
   readonly #layout: ReturnType<typeof resolveLayout>;
@@ -902,7 +930,7 @@ export class DatDocument {
     const cursor = new DatCursor(source);
     const signature = cursor.readU32("DAT signature");
     const maxIds = [
-      cursor.readU16("DAT maximum item ID"),
+      layout.extendedItems ? cursor.readU32("DAT maximum item ID") : cursor.readU16("DAT maximum item ID"),
       cursor.readU16("DAT maximum outfit ID"),
       cursor.readU16("DAT maximum effect ID"),
       cursor.readU16("DAT maximum missile ID"),
@@ -949,10 +977,9 @@ export class DatDocument {
       effects: [],
       missiles: [],
     } as Record<DatCategory, MutableRecord[]>;
-    const empty = Buffer.alloc(12);
-    empty.writeUInt32LE(signature);
-    empty.writeUInt16LE(99, 4);
-    return new DatDocument(empty, signature, resolveLayout(options), options, records);
+    const layout = resolveLayout(options);
+    const empty = datHeader(signature, [99, 0, 0, 0], layout.extendedItems);
+    return new DatDocument(empty, signature, layout, options, records);
   }
 
   get dirty(): boolean {
@@ -1210,7 +1237,7 @@ export class DatDocument {
 
   createRecord(category: DatCategory, sourceId?: number): number {
     const records = this.#records[category];
-    const categoryLimit = category === "items" ? 65_436 : 65_535;
+    const categoryLimit = category !== "items" ? 65_535 : this.#layout.extendedItems ? MAX_TOTAL_RECORDS : 65_436;
     if (records.length >= categoryLimit) throw new DatFormatError(`${category} category is full`);
     let record: MutableRecord;
     if (sourceId === undefined) {
@@ -1255,14 +1282,8 @@ export class DatDocument {
       this.#records.effects.length,
       this.#records.missiles.length,
     ];
-    if (maxima.some((value) => value > 0xffff)) {
-      throw new DatFormatError("DAT category maximum ID exceeds the 16-bit header limit");
-    }
-    const header = Buffer.alloc(12);
-    header.writeUInt32LE(this.#signature, 0);
-    maxima.forEach((value, index) => header.writeUInt16LE(value, 4 + index * 2));
     return Buffer.concat([
-      header,
+      datHeader(this.#signature, maxima, this.#layout.extendedItems),
       ...CATEGORIES.flatMap((category) =>
         this.#records[category].map((record) => Buffer.concat([
           record.flagBytes,

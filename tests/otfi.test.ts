@@ -59,3 +59,8 @@ test("rejects unsafe asset paths and unsupported sprite dimensions", () => {
   const unsupportedSize = OtfiDocument.parse("DatSpr\n  sprite-size: 48\n");
   assert.throws(() => unsupportedSize.settings, /Unsupported OTFI sprite-size/);
 });
+
+test("reads the extended-items option", () => {
+  assert.equal(OtfiDocument.parse("DatSpr\n  extended-items: true\n").settings.extendedItems, true);
+  assert.equal(OtfiDocument.parse("DatSpr\n  extended: true\n").settings.extendedItems, undefined);
+});

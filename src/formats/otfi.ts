@@ -5,6 +5,8 @@ export interface OtfiSettings {
   readonly transparency: boolean;
   readonly frameDurations: boolean;
   readonly frameGroups: boolean;
+  /** Item count in the DAT header is a u32 instead of a u16 (OTFI key `extended-items`). */
+  readonly extendedItems?: boolean;
   readonly metadataFile: string;
   readonly spritesFile: string;
   readonly spriteSize: number;
@@ -85,6 +87,7 @@ export class OtfiDocument {
       `  transparency: ${settings.transparency}`,
       `  frame-durations: ${settings.frameDurations}`,
       `  frame-groups: ${settings.frameGroups}`,
+      ...(settings.extendedItems === true ? ["  extended-items: true"] : []),
       "  metadata-controller: default",
       "  attribute-server: tfs1.4",
       `  metadata-file: ${settings.metadataFile}`,
@@ -117,6 +120,7 @@ export class OtfiDocument {
       transparency: parseBoolean(this.#values.get("transparency") ?? "false"),
       frameDurations: parseBoolean(this.#values.get("frame-durations") ?? "false"),
       frameGroups: parseBoolean(this.#values.get("frame-groups") ?? "false"),
+      ...(parseBoolean(this.#values.get("extended-items") ?? "false") ? { extendedItems: true } : {}),
       metadataFile,
       spritesFile,
       spriteSize,

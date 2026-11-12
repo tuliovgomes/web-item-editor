@@ -188,3 +188,25 @@ test("accepts records whose animation has zero frames and no sprite IDs", () => 
   assert.deepEqual(record?.groups[0]?.spriteIds, []);
   assert.deepEqual(DatDocument.parse(source, classic).serialize(), source);
 });
+
+test("reads and writes the u32 item count header of OTFI extended-items DATs", () => {
+  const options = {
+    clientVersion: 960,
+    otfi: { extended: true, frameDurations: false, frameGroups: false, extendedItems: true },
+  } as const;
+  const source = Buffer.concat([
+    u32(0x1234_5678), u32(100), u16(0), u16(0), u16(0),
+    Buffer.from([0xff, 1, 1, 1, 1, 1, 1, 1]), u32(42),
+  ]);
+  const document = DatDocument.parse(source, options);
+  assert.equal(document.getRecordCount("items"), 1);
+  assert.deepEqual(document.getRecord("items", 100)?.groups[0]?.spriteIds, [42]);
+  assert.throws(() => DatDocument.parse(source, { ...options, otfi: { ...options.otfi, extendedItems: false } }));
+
+  assert.equal(document.createRecord("items"), 101);
+  const output = document.serialize();
+  assert.equal(output.readUInt32LE(4), 101);
+  assert.equal(output.length, source.length + 12);
+  assert.equal(DatDocument.parse(output, options).getRecordCount("items"), 2);
+  assert.equal(DatDocument.parse(DatDocument.create(1, options).serialize(), options).getRecordCount("items"), 0);
+});

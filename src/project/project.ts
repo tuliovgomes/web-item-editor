@@ -75,6 +75,7 @@ function parseOptions(clientVersion: number, settings: OtfiSettings): DatParseOp
       extended: settings.extended,
       frameDurations: settings.frameDurations,
       frameGroups: settings.frameGroups,
+      extendedItems: settings.extendedItems === true,
     },
   };
 }
